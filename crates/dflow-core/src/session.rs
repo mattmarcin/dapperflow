@@ -155,8 +155,14 @@ impl Session {
             .openpty(PtySize { rows: spec.rows, cols: spec.cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| SessionError::Pty(format!("openpty: {e}")))?;
 
-        let mut cmd = CommandBuilder::new(&spec.command[0]);
-        for arg in &spec.command[1..] {
+        // Resolve the program to a launchable Windows form before spawning: a bare
+        // manifest command like `codex`/`opencode`/`pi` otherwise resolves (inside
+        // portable-pty) to an extension-less `#!/bin/sh` shim that `CreateProcessW`
+        // rejects with os error 193; a `.cmd`/`.bat` shim is rewritten to run under
+        // `cmd.exe /c` (`agents::launchable_command`; audit finding #2).
+        let launch_argv = crate::agents::launchable_command(&spec.command);
+        let mut cmd = CommandBuilder::new(&launch_argv[0]);
+        for arg in &launch_argv[1..] {
             cmd.arg(arg);
         }
         if let Some(cwd) = &spec.cwd {
