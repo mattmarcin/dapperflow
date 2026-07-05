@@ -41,3 +41,12 @@ ghost_text_styles = ["dim"]
 [capabilities]
 mcp = true          # [L] --approve-mcps, plugin/MCP support in --help
 native_tier2 = "unaudited (headless -p --output-format stream-json)"
+
+[context_injection]
+# Standing dflow guidance for a New Session (adapters.md / Standing-guidance injection).
+# cursor-agent is a detection candidate pending its Phase 2 capability audit and keeps
+# no_auto_steer = true, so its composer and first-prompt submit are UNTRUSTED. Rather than
+# rely on an unprobed first-prompt path or write into the repo, cursor is flagged
+# guidance-unsupported for New Session until audited. Set once the audit verifies a
+# session-scoped, non-polluting mechanism.
+method = "none"   # [S] flagged guidance-unsupported until the cursor audit

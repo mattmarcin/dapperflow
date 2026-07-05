@@ -37,3 +37,12 @@ ghost_text_styles = ["dim"]
 [capabilities]
 mcp = true          # [L] codex mcp add / [mcp_servers]
 native_tier2 = "notify + exec --json"
+
+[context_injection]
+# Standing dflow guidance for a New Session (adapters.md / Standing-guidance injection).
+# [D] 2026-07-05: codex has NO session-scoped system-prompt flag. Its only non-repo
+# instructions channel is the GLOBAL per-user ~/.codex/AGENTS.md, which would leak the
+# guidance into every unrelated codex session and clobber the user's own global config -
+# so it is not usable. Fall back to prepending the guidance to the first prompt (degraded,
+# but non-polluting: it never touches the user's checkout).
+method = "first_prompt"   # [D]

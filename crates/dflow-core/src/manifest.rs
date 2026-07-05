@@ -31,6 +31,8 @@ pub struct Manifest {
     pub composer: ComposerSection,
     #[serde(default)]
     pub capabilities: CapabilitiesSection,
+    #[serde(default)]
+    pub context_injection: ContextInjectionSection,
 }
 
 /// `[adapter]`: identity plus the launch line and its flag arrays.
@@ -135,6 +137,57 @@ pub struct CapabilitiesSection {
     pub native_tier2: String,
 }
 
+/// `[context_injection]`: how this harness receives the standing `dflow` usage guidance
+/// as ambient context for a session with no composed brief (a New Session), injected the
+/// least-intrusive way the harness allows and NEVER by writing into the user's project
+/// checkout (`adapters.md` / Standing-guidance injection).
+///
+/// The method is resolved per harness by the adapter probe and recorded here as data, so
+/// adding or changing a harness is a manifest edit, not an engine change.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextInjectionSection {
+    /// One of [`CI_APPEND_SYSTEM_PROMPT`], [`CI_FIRST_PROMPT`], or [`CI_NONE`]:
+    /// - `append_system_prompt`: splice [`Self::flag`] (with `{guidance}` replaced) into
+    ///   the launch argv - a session-scoped, non-polluting system-prompt append (the
+    ///   preferred mechanism, e.g. Claude Code `--append-system-prompt`).
+    /// - `first_prompt`: the harness has no session-scoped system-prompt flag and only a
+    ///   global (per-user) or repo instructions file, so the guidance is prepended to the
+    ///   session's first prompt instead - documented as degraded (it rides in the visible
+    ///   conversation, never in the user's checkout).
+    /// - `none`: no non-polluting mechanism at all, so a New Session on this harness
+    ///   launches WITHOUT standing guidance rather than writing into the user's repo.
+    #[serde(default = "default_ci_method")]
+    pub method: String,
+    /// For `append_system_prompt`: the flag pair spliced into argv, with a `{guidance}`
+    /// placeholder replaced by the standing-guidance text (e.g.
+    /// `["--append-system-prompt", "{guidance}"]`).
+    #[serde(default)]
+    pub flag: Vec<String>,
+}
+
+/// `context_injection.method`: a session-scoped launch flag appends the guidance to the
+/// system prompt (preferred; no repo pollution, works for a New Session with no brief).
+pub const CI_APPEND_SYSTEM_PROMPT: &str = "append_system_prompt";
+/// `context_injection.method`: no system-prompt flag; prepend the guidance to the first
+/// prompt (degraded, documented). Non-polluting: it never touches the user's checkout.
+pub const CI_FIRST_PROMPT: &str = "first_prompt";
+/// `context_injection.method`: no non-polluting mechanism; New Session launches without
+/// standing guidance (the harness is flagged guidance-unsupported).
+pub const CI_NONE: &str = "none";
+
+/// Every accepted `context_injection.method` value.
+const CI_METHODS: &[&str] = &[CI_APPEND_SYSTEM_PROMPT, CI_FIRST_PROMPT, CI_NONE];
+
+impl Default for ContextInjectionSection {
+    fn default() -> Self {
+        Self { method: default_ci_method(), flag: Vec::new() }
+    }
+}
+
+fn default_ci_method() -> String {
+    CI_NONE.to_string()
+}
+
 /// Errors parsing or validating a manifest.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -184,6 +237,24 @@ impl Manifest {
         }
         if self.composer.popup_settle_ms == 0 {
             return Err(self.invalid("composer.popup_settle_ms must be greater than zero"));
+        }
+        let ci_method = self.context_injection.method.as_str();
+        if !CI_METHODS.contains(&ci_method) {
+            return Err(self.invalid(&format!(
+                "context_injection.method must be one of {CI_METHODS:?}, got '{ci_method}'"
+            )));
+        }
+        if ci_method == CI_APPEND_SYSTEM_PROMPT {
+            if self.context_injection.flag.is_empty() {
+                return Err(
+                    self.invalid("context_injection.flag must be non-empty for append_system_prompt")
+                );
+            }
+            if !self.context_injection.flag.iter().any(|t| t.contains("{guidance}")) {
+                return Err(self.invalid(
+                    "context_injection.flag must contain a {guidance} placeholder for append_system_prompt",
+                ));
+            }
         }
         Ok(())
     }
@@ -252,6 +323,22 @@ impl Manifest {
                 .map(|t| t.replace("{command}", command).replace("{resume_ref}", resume_ref))
                 .collect(),
         )
+    }
+
+    /// The launch-argv flag that injects `guidance` into this harness's system prompt,
+    /// with `{guidance}` filled in, or `None` when the harness does not use the
+    /// `append_system_prompt` method (`adapters.md` / Standing-guidance injection).
+    pub fn context_injection_flag(&self, guidance: &str) -> Option<Vec<String>> {
+        if self.context_injection.method != CI_APPEND_SYSTEM_PROMPT {
+            return None;
+        }
+        Some(self.context_injection.flag.iter().map(|t| t.replace("{guidance}", guidance)).collect())
+    }
+
+    /// This harness's context-injection method (`adapters.md`): one of
+    /// [`CI_APPEND_SYSTEM_PROMPT`], [`CI_FIRST_PROMPT`], or [`CI_NONE`].
+    pub fn context_injection_method(&self) -> &str {
+        &self.context_injection.method
     }
 }
 
@@ -480,5 +567,77 @@ launch = ["{command}", "{prompt}"]
         assert_eq!(c.popup_prefixes, vec!["/".to_string()]);
         assert!(c.popup_settle_ms > 0);
         assert!(c.ghost_text_styles.iter().any(|s| s == "dim"));
+    }
+
+    #[test]
+    fn claude_context_injection_is_system_prompt_append() {
+        let set = ManifestSet::bundled().unwrap();
+        let claude = set.get("claude").unwrap();
+        assert_eq!(claude.context_injection_method(), CI_APPEND_SYSTEM_PROMPT);
+        // The flag is resolved with the guidance text spliced in, ready to splice into argv.
+        assert_eq!(
+            claude.context_injection_flag("USE DFLOW"),
+            Some(vec!["--append-system-prompt".to_string(), "USE DFLOW".to_string()])
+        );
+    }
+
+    #[test]
+    fn fallback_harnesses_have_no_system_prompt_flag() {
+        let set = ManifestSet::bundled().unwrap();
+        // codex/opencode/pi offer no session-scoped system-prompt flag (only global or
+        // repo instructions files, which would pollute), so they fall back to first_prompt.
+        for name in ["codex", "opencode", "pi"] {
+            let m = set.get(name).unwrap();
+            assert_eq!(m.context_injection_method(), CI_FIRST_PROMPT, "{name}");
+            assert_eq!(m.context_injection_flag("g"), None, "{name} has no append flag");
+        }
+        // cursor is unaudited (no_auto_steer): flagged guidance-unsupported for New Session.
+        assert_eq!(set.get("cursor").unwrap().context_injection_method(), CI_NONE);
+    }
+
+    #[test]
+    fn append_system_prompt_requires_a_guidance_placeholder() {
+        // A manifest declaring append_system_prompt with no {guidance} placeholder is
+        // rejected at parse time, so the flag can never launch empty.
+        let text = r#"
+[adapter]
+name = "bad"
+command = "bad"
+launch = ["{command}", "{prompt}"]
+
+[context_injection]
+method = "append_system_prompt"
+flag = ["--append-system-prompt", "static"]
+"#;
+        let err = Manifest::parse("bad", text).unwrap_err();
+        assert!(matches!(err, ManifestError::Invalid { .. }));
+    }
+
+    #[test]
+    fn unknown_context_injection_method_is_rejected() {
+        let text = r#"
+[adapter]
+name = "bad"
+command = "bad"
+launch = ["{command}", "{prompt}"]
+
+[context_injection]
+method = "telepathy"
+"#;
+        let err = Manifest::parse("bad", text).unwrap_err();
+        assert!(matches!(err, ManifestError::Invalid { .. }));
+    }
+
+    #[test]
+    fn default_context_injection_method_is_none() {
+        // A manifest with no [context_injection] section defaults to none (guidance-off),
+        // never accidentally polluting or half-configuring a harness.
+        let m = Manifest::parse(
+            "x",
+            "[adapter]\nname=\"x\"\ncommand=\"x\"\nlaunch=[\"{command}\",\"{prompt}\"]\n",
+        )
+        .unwrap();
+        assert_eq!(m.context_injection_method(), CI_NONE);
+        assert_eq!(m.context_injection_flag("g"), None);
     }
 }

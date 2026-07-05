@@ -1341,15 +1341,23 @@ pub fn inject_agent_env(
 /// current card, session state/note, acceptance criteria, and the project digest from
 /// the token scope (`agent-cli.md` / Verbs).
 pub fn agent_context(state: &AppState, token: &AgentToken) -> Result<AgentContextResult, ProtocolError> {
-    let card = match &token.card_id {
+    let session_row = match token.session_id() {
+        Some(sid) => state.store.get_session(&sid).map_err(store_err)?,
+        None => None,
+    };
+    // The effective card: the token's dispatch card, else the card a cardless New Session
+    // adopted via `dflow card create` (persisted on its session row), so bare `dflow`
+    // shows the adopted card instead of "no card assigned" once work is on the board.
+    let effective_card_id = token
+        .card_id
+        .clone()
+        .or_else(|| session_row.as_ref().and_then(|r| r.card_id.clone()));
+    let card = match &effective_card_id {
         Some(cid) => state.store.get_card(cid).map_err(store_err)?,
         None => None,
     };
-    let (session_state, status_note) = match token.session_id() {
-        Some(sid) => match state.store.get_session(&sid).map_err(store_err)? {
-            Some(row) => (Some(row.state), row.status_note),
-            None => (None, None),
-        },
+    let (session_state, status_note) = match &session_row {
+        Some(row) => (Some(row.state.clone()), row.status_note.clone()),
         None => (None, None),
     };
     let acceptance = card
@@ -1601,6 +1609,16 @@ pub fn card_create_scoped(
         })
         .map_err(store_err)?;
     token.record_created_card(&card.id);
+    // A cardless New Session adopts its FIRST created card as the session's card, so the
+    // board shows the session under it and bare `dflow` / `dflow status` resolve to it
+    // going forward (`agent-cli.md`: `dflow card create` sets the session's card). Only
+    // fills an empty link (first card wins); a dispatched session has `card_id` set and is
+    // skipped, so its follow-up cards stay follow-ups.
+    if token.card_id.is_none() {
+        if let Some(session_id) = token.session_id() {
+            let _ = state.store.set_session_card(&session_id, &card.id);
+        }
+    }
     Ok(CardCreated { card_id: card.id.clone(), card, dedupe: Some("created".to_string()) })
 }
 
@@ -2842,6 +2860,80 @@ notifies the captain), `dflow status done [note]` when the work is complete.
 durable notes, `dflow know get <id>` reads one. When you learn something durable, record \
 it: `dflow know add --type <t> --title \"...\" --stdin`.";
 
+/// The standing `dflow` guidance injected as ambient context into EVERY session through
+/// the harness's system-prompt / first-prompt mechanism, so a plain New Session keeps the
+/// board current without the user ever having to say "use dflow" (`agent-cli.md` /
+/// Availability and standing guidance; the "standing guidance content" bullets).
+///
+/// Unlike [`DFLOW_USAGE_CONTRACT`] (composed into the dispatch brief), this is the compact
+/// system-prompt form used where there is no brief; it is deliberately lightweight.
+pub const DFLOW_STANDING_GUIDANCE: &str = "\
+You are running inside a DapperFlow session and the `dflow` CLI is on your PATH. Keep the \
+board current as a natural side effect of your work - the user should never have to tell \
+you to use it:
+- Before re-deriving any project fact, check memory first: `dflow know find <topic>`.
+- When you begin real work on something, put it on the board: `dflow card create --title \
+\"...\"` (or adopt the card already set for this session if there is one).
+- Keep the board honest at meaningful boundaries: `dflow status working \"<short note>\"`, \
+`dflow status blocked \"<the decision you need>\"` when you need the human, `dflow status \
+done` when finished.
+- When you learn something durable (a decision, convention, gotcha, runbook step), record \
+it: `dflow know add --type <t> --title \"...\"`.
+- Keep it lightweight: a card per real unit of work, not per message. Run `dflow` any time \
+to see your current card, state, and next step.";
+
+/// How a harness received (or could not receive) the standing guidance for a session,
+/// per its manifest `context_injection` method (`adapters.md` / Standing-guidance
+/// injection). Returned by [`apply_standing_guidance`] so the caller knows whether it must
+/// still prepend a first-prompt preamble.
+pub enum GuidanceInjection {
+    /// The system-prompt flag was spliced into the launch argv; nothing else to do.
+    SystemPrompt,
+    /// No system-prompt flag; the caller must prepend this preamble to the session's
+    /// first prompt (degraded, but non-polluting). Carries the guidance text.
+    FirstPromptPreamble(String),
+    /// No non-polluting mechanism (or no manifest / a plain shell): the session launches
+    /// without standing guidance rather than writing into the user's checkout.
+    None,
+}
+
+/// Inject the standing `dflow` guidance into a session launch the least-intrusive way the
+/// harness allows, mutating `command` in place for the `append_system_prompt` method
+/// (`adapters.md` / Standing-guidance injection). Returns how it was handled so the caller
+/// can complete a first-prompt fallback.
+///
+/// This is the New Session path: dispatch composes the contract into the brief already,
+/// and a Concertmaster round carries its own purpose-built brief, so this is applied only
+/// where a session would otherwise have no ambient dflow guidance at all.
+pub fn apply_standing_guidance(harness: &str, command: &mut Vec<String>) -> GuidanceInjection {
+    let manifest = match bundled_manifests().get(harness) {
+        Some(m) => m,
+        // A plain shell (powershell/cmd) or an unmanifested command: nothing to inject.
+        None => return GuidanceInjection::None,
+    };
+    match manifest.context_injection_method() {
+        dflow_core::manifest::CI_APPEND_SYSTEM_PROMPT => {
+            if let Some(flag) = manifest.context_injection_flag(DFLOW_STANDING_GUIDANCE) {
+                // Splice the flag right after the command binary (argv[0]), so it groups
+                // with the manifest flags and never lands after a trailing positional or a
+                // launcher's extra_args.
+                let insert_at = command.len().min(1);
+                for (i, tok) in flag.into_iter().enumerate() {
+                    command.insert(insert_at + i, tok);
+                }
+                GuidanceInjection::SystemPrompt
+            } else {
+                GuidanceInjection::None
+            }
+        }
+        dflow_core::manifest::CI_FIRST_PROMPT => {
+            GuidanceInjection::FirstPromptPreamble(DFLOW_STANDING_GUIDANCE.to_string())
+        }
+        // CI_NONE (or anything else): flagged guidance-unsupported for New Session.
+        _ => GuidanceInjection::None,
+    }
+}
+
 // ---- helpers ----
 
 /// Compose the dispatch brief (`adapters.md` dispatch flow step 6): the card brief, its
@@ -3057,6 +3149,57 @@ mod tests {
     use super::*;
     use dflow_core::recipe::RecipeCatalog;
     use dflow_core::{DataDir, NewSession};
+
+    #[test]
+    fn standing_guidance_splices_claude_system_prompt_flag() {
+        // claude uses the append_system_prompt method, so the flag is spliced into argv
+        // right after the binary, carrying the standing guidance - no repo pollution.
+        let mut cmd = vec!["claude".to_string(), "--permission-mode".to_string(), "acceptEdits".to_string()];
+        let result = apply_standing_guidance("claude", &mut cmd);
+        assert!(matches!(result, GuidanceInjection::SystemPrompt));
+        assert_eq!(cmd[0], "claude");
+        assert_eq!(cmd[1], "--append-system-prompt");
+        assert_eq!(cmd[2], DFLOW_STANDING_GUIDANCE);
+        // The original flags are preserved after the injected pair.
+        assert!(cmd.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
+    }
+
+    #[test]
+    fn standing_guidance_fallback_is_a_first_prompt_preamble() {
+        // codex has no system-prompt flag, so the caller is handed the preamble to prepend
+        // to the first prompt (degraded, but never into the user's checkout). The argv is
+        // left untouched.
+        let mut cmd = vec!["codex".to_string()];
+        match apply_standing_guidance("codex", &mut cmd) {
+            GuidanceInjection::FirstPromptPreamble(text) => assert_eq!(text, DFLOW_STANDING_GUIDANCE),
+            _ => panic!("codex should hand back a first-prompt preamble"),
+        }
+        assert_eq!(cmd, vec!["codex".to_string()], "first_prompt fallback never edits argv");
+    }
+
+    #[test]
+    fn standing_guidance_none_for_unsupported_or_plain_shell() {
+        // cursor is flagged guidance-unsupported; a plain shell has no manifest. Both leave
+        // the argv untouched and inject nothing.
+        let mut cursor = vec!["cursor-agent".to_string()];
+        assert!(matches!(apply_standing_guidance("cursor", &mut cursor), GuidanceInjection::None));
+        assert_eq!(cursor, vec!["cursor-agent".to_string()]);
+        let mut shell = vec!["powershell".to_string()];
+        assert!(matches!(apply_standing_guidance("powershell", &mut shell), GuidanceInjection::None));
+    }
+
+    #[test]
+    fn standing_guidance_text_carries_the_contract_bullets() {
+        // The injected guidance must actually tell the agent when and how to use dflow
+        // (agent-cli.md / standing guidance content), so a New Session is self-explaining.
+        let g = DFLOW_STANDING_GUIDANCE;
+        assert!(g.contains("dflow know find"), "must say to consult memory first");
+        assert!(g.contains("dflow card create"), "must say to put work on the board");
+        assert!(g.contains("dflow status working"), "must say to self-report progress");
+        assert!(g.contains("dflow status blocked"), "must say to escalate when blocked");
+        assert!(g.contains("dflow status done"), "must say to report completion");
+        assert!(g.contains("dflow know add"), "must say to record durable learnings");
+    }
 
     /// A minimal in-memory `AppState` for handler unit tests (no listener, no PTYs).
     fn test_state() -> (AppState, tempdir_guard::TempDir) {

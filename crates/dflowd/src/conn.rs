@@ -284,10 +284,11 @@ async fn dispatch_control(
             // (interactive, no brief) contributes its argv, harness, extra env, and
             // launcher id; else the Phase 0 default shell for the harness name.
             let explicit = payload.command.clone().filter(|c| !c.is_empty());
+            let command_is_explicit = explicit.is_some();
             let mut harness = payload.harness.clone();
             let mut env = payload.env.clone();
             let mut agent_id: Option<String> = None;
-            let command = if let Some(cmd) = explicit {
+            let mut command = if let Some(cmd) = explicit {
                 cmd
             } else if let Some(agent_ref) = payload.agent.as_deref().filter(|s| !s.trim().is_empty()) {
                 match api::resolve_agent_launch(state, agent_ref) {
@@ -331,6 +332,17 @@ async fn dispatch_control(
                 .map(|p| p.trim())
                 .filter(|p| !p.is_empty())
                 .map(|p| p.to_string());
+            // Standing dflow guidance (adapters.md / Standing-guidance injection): a New
+            // Session has no composed brief, so inject the usage contract through the
+            // harness's system-prompt mechanism, NEVER by writing into the user's checkout.
+            // Only for a command we built for a known harness; an explicit raw command is
+            // left untouched. The result tells us whether to also prepend a first-prompt
+            // preamble for a harness with no system-prompt flag.
+            let guidance = if command_is_explicit {
+                api::GuidanceInjection::None
+            } else {
+                api::apply_standing_guidance(&harness, &mut command)
+            };
             // Mint a per-task token so a New Session agent can self-report and maintain
             // the board through `dflow` too, and inject the agent-CLI env before spawn
             // (env can only enter a process at spawn).
@@ -362,14 +374,46 @@ async fn dispatch_control(
             match state.sessions.create(spec) {
                 Ok(session) => {
                     tracing::info!(session_id = %session.id, "session created");
+                    // Telemetry: how this session received its standing dflow guidance
+                    // (`adapters.md` / Standing-guidance injection), so operators can see
+                    // which New Sessions are self-explaining and which harnesses are
+                    // degraded or unsupported.
+                    match &guidance {
+                        api::GuidanceInjection::SystemPrompt => tracing::info!(
+                            session_id = %session.id, harness = %session.harness,
+                            "standing dflow guidance: append_system_prompt"
+                        ),
+                        api::GuidanceInjection::FirstPromptPreamble(_) => tracing::info!(
+                            session_id = %session.id, harness = %session.harness,
+                            "standing dflow guidance: first_prompt (degraded)"
+                        ),
+                        api::GuidanceInjection::None => tracing::debug!(
+                            session_id = %session.id, harness = %session.harness,
+                            "standing dflow guidance: none"
+                        ),
+                    }
                     // Bind the per-task token to the freshly spawned session.
                     token_handle.bind_session(&session.id.to_string());
+                    // Answer a first-run trust/permission dialog per the manifest, exactly
+                    // as dispatch does (`adapters.md` / dialogs), so a New Session on a
+                    // harness with a trust gate is not left hanging before it can process
+                    // its first prompt. A harness with no trust rule is a no-op.
+                    api::spawn_trust_watcher(Arc::clone(&session), session.harness.clone());
                     // Wire the New Session first prompt through verified submit once the
                     // composer is ready (`adapters.md` / Verified submit). The submit
                     // runs in the background; failure raises Needs You, never silently
                     // drops the message.
                     let queued = first_prompt.is_some();
                     if let Some(prompt) = first_prompt {
+                        // First-prompt fallback (adapters.md): a harness with no system-
+                        // prompt flag gets the standing guidance prepended to its first
+                        // prompt instead (degraded, but never into the user's checkout).
+                        let prompt = match &guidance {
+                            api::GuidanceInjection::FirstPromptPreamble(g) => {
+                                format!("{g}\n\n---\n\n{prompt}")
+                            }
+                            _ => prompt,
+                        };
                         api::spawn_first_prompt_submit(state, Arc::clone(&session), prompt);
                     }
                     send(out_tx, &Envelope::message(id, "session.create", SessionCreated { session_id: session.id.to_string(), first_prompt_queued: queued }));
