@@ -12,7 +12,7 @@
 // M7 (mobile.md 2.2) replaces this with the shared packages/client-core.
 // ============================================================================
 
-import { AuthWelcome, Envelope, PROTOCOL_VERSION, ProtocolError, SessionAttached } from "./protocol";
+import { AuthWelcome, Envelope, PROTOCOL_VERSION, ProtocolError, SessionPeeked } from "./protocol";
 
 export type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
@@ -158,21 +158,16 @@ export class DflowMobileClient {
   }
 
   /**
-   * session.attach { session_id, cols, rows } -> the styled screen snapshot for the
-   * read-only peek. The phone reads the snapshot, then immediately detaches: it never
-   * holds a live PTY attachment, never registers an output handler, never types.
+   * session.peek { session_id, lines? } -> SessionPeeked { session_id, lines, text }: a
+   * read-only, bounded, scrubbed plain-text screen capture that never resizes or attaches
+   * the PTY. This is the ONLY terminal read the phone scope permits - session.attach is
+   * forbidden over the phone token (dispatch_phone routes session.peek only), so the old
+   * attach/detach pair was rejected with `forbidden`.
    */
-  async peek(sessionId: string, cols = 80, rows = 24): Promise<SessionAttached> {
-    const attached = await this.call<SessionAttached>("session.attach", {
-      session_id: sessionId,
-      cols,
-      rows,
-    });
-    // Release the attachment right away - read-only, no streaming (protocol.md
-    // backpressure: a slow client gets a fresh snapshot on catch-up, which is exactly
-    // the poll model here).
-    this.call("session.detach", { session_id: sessionId }).catch(() => undefined);
-    return attached;
+  async peek(sessionId: string, lines?: number): Promise<SessionPeeked> {
+    const payload: { session_id: string; lines?: number } = { session_id: sessionId };
+    if (lines !== undefined) payload.lines = lines;
+    return this.call<SessionPeeked>("session.peek", payload);
   }
 
   get connected(): boolean {
