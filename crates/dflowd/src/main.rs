@@ -31,6 +31,14 @@ fn main() -> Result<()> {
         std::env::set_var("DFLOW_DATA_DIR", dir);
     }
 
+    // `--version`/`-V`: print the build string and exit. The desktop app runs this on the
+    // bundled and the installed daemon to decide whether to refresh its managed copy
+    // (`daemon-lifecycle.md` / Production: copy when the bundled version is newer).
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{VERSION}");
+        return Ok(());
+    }
+
     // Lifecycle control verbs exit without starting a daemon.
     if args.iter().any(|a| a == "--status") {
         return control::status();
