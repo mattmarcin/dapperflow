@@ -8,13 +8,14 @@
 //!   cargo test -p dflowd --test live_dflow_everywhere -- --ignored --nocapture
 //!
 //! It launches a claude launcher (adapter=claude, --model haiku) through the New Session
-//! front door in an isolated scratch project, then proves two things:
-//!   1. Guidance in context (deterministic): the daemon composed the launch with
-//!      `--append-system-prompt <standing guidance>`, logged as
-//!      "standing dflow guidance: append_system_prompt".
-//!   2. Availability (behavioral): steering the session to run `dflow` yields the cardless
-//!      "no card assigned" surface, proving the binary is on the session PATH and talks to
-//!      the daemon over the injected token/endpoint.
+//! front door in an isolated scratch project, then proves two things.
+//! One, guidance in context (deterministic): the daemon composed the launch with
+//! `--append-system-prompt <standing guidance>`, logged as
+//! "standing dflow guidance: append_system_prompt".
+//! Two, availability (behavioral): steering the session to run `dflow` yields the cardless
+//! "no card assigned" surface, proving the binary is on the session PATH and talks to the
+//! daemon over the injected token/endpoint.
+//!
 //! The session is kept short and kill-verified; the daemon is this worktree's own build in
 //! an isolated DFLOW_DATA_DIR, never the user's running daemon.
 
