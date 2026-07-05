@@ -27,10 +27,8 @@ ship:
 
 Design matters here, so invest in the artifact.
 Surface the real decisions and their tradeoffs, and expect more than one annotation round.
-Do not begin implementation until the plan is explicitly approved.
-
-Note for this milestone: the Plan Studio review loop and enforced plan approval arrive with Plan Studio.
-Until then this stage validates and parses, but the daemon cannot yet hold you at an unapproved plan; treat the plan as guidance and keep the human in the loop through status notes.
+Hold the plan review loop: open the artifact, then wait on a foreground `dflow plan poll`, revising `plan.html` in place and re-opening it between rounds.
+Do not begin implementation until a poll returns `approved`; your planning session is not done before then, so never background the poll or end the session while it is your turn to wait.
 
 ## implement
 

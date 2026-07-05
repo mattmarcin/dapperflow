@@ -1978,9 +1978,14 @@ pub fn env_import(state: &AppState, req: EnvImport) -> Result<EnvImportResult, P
 
 // ---- artifact.* (Plan Studio, `plan-studio.md`, `protocol.md` / artifact.*) ----
 
-/// The bounded long-poll budget for `artifact.feedback.poll`: under the ~4-minute
-/// harness tool timeout (`agent-cli.md`), returning `pending` so the agent re-polls.
-const POLL_BUDGET: Duration = Duration::from_secs(210);
+/// The bounded server-side long-poll budget for `artifact.feedback.poll`. Deliberately
+/// under the *default* harness tool timeout (Claude Code's Bash tool defaults to 120s),
+/// not the ~4-minute ceiling: a foreground `dflow plan poll` that outran the default
+/// timeout was killed mid-wait, which is what taught the live planning agent to background
+/// the poll and end its turn (audit finding #4). At 100s the poll returns `pending` well
+/// inside the default window, so a single foreground invocation completes cleanly and its
+/// `next:` line carries the agent straight back into another poll.
+const POLL_BUDGET: Duration = Duration::from_secs(100);
 /// Re-check cadence inside a long-poll: the store is truth (feedback is never lost), so a
 /// missed wakeup costs at most one tick.
 const POLL_TICK: Duration = Duration::from_secs(2);
@@ -2320,18 +2325,24 @@ fn pending_result(artifact_id: &str, art: &dflow_core::ArtifactRow) -> FeedbackP
         pending: true,
         approved: false,
         status: art.status.clone(),
-        next_step: "no feedback queued yet; run `dflow plan poll` again to keep waiting".to_string(),
+        next_step: "still waiting - the human has not sent feedback yet; run `dflow plan poll` \
+             again now, in the foreground, to keep holding the loop; do not end your session"
+            .to_string(),
     }
 }
 
-/// The `next:` line for a delivered/ended poll (`agent-cli.md` design rule 6).
+/// The `next:` line for a delivered/ended poll (`agent-cli.md` design rule 6). The
+/// feedback line names the exact re-open command so a single foreground poll carries the
+/// agent through the whole loop by its `next:` lines alone (audit finding #4).
 fn poll_next_step(ended: bool, approved: bool) -> &'static str {
     if approved {
         "plan approved; stop polling and proceed to implement in your main channel"
     } else if ended {
         "the review ended; stop polling and proceed per the human's guidance"
     } else {
-        "revise the artifact in place, then run `dflow plan open <file>` and `dflow plan poll` again"
+        "revise the artifact in place, then re-run `dflow plan open <file>` (this opens a new \
+         round) and `dflow plan poll` again in the foreground - the plan stage is not done \
+         until a poll returns `approved`"
     }
 }
 
@@ -2848,6 +2859,32 @@ pub fn rebuild_all_knowledge_indexes(state: &AppState) {
     }
 }
 
+/// The imperative plan-review-loop contract injected into a plan-stage brief with required
+/// approval (`plan-studio.md` / The loop). Agents are probabilistic, so the required
+/// behavior is spelled out as steps the agent must not skip: hold a FOREGROUND `dflow plan
+/// poll` and do not end the session until the poll returns `approved`. This is the
+/// belt-and-suspenders guidance layer for audit finding #4 (the plan-review loop stall).
+const PLAN_REVIEW_LOOP_PROTOCOL: &str = "\
+This recipe requires human plan approval, and you reach it by holding the plan review \
+loop yourself - do not skip or shortcut it:
+
+1. Write a self-contained `plan.html` in your card's directory.
+2. Register it for review: `dflow plan open plan.html`.
+3. Run `dflow plan poll` in the FOREGROUND and wait. It blocks until the human sends \
+feedback or approves, then returns. Do NOT background it, do NOT run it and move on, and \
+do NOT end your session while it is your turn to wait - this poll IS your main loop here.
+4. When a poll returns feedback: revise `plan.html` in place, then re-run `dflow plan open \
+plan.html` (re-opening the same file starts a new review round and is never an error), \
+and poll again.
+5. If a poll comes back with no feedback queued yet, it just timed out while waiting - \
+immediately run `dflow plan poll` again in the foreground to keep holding the loop.
+6. Repeat until a poll returns `approved`. Only then is the plan stage done and you may \
+proceed to implementation. Every poll response ends with a `next:` line naming the exact \
+next command - follow it.
+
+`dflow status done` is NOT plan approval; approval comes only from a poll returning \
+`approved`. Your session is not finished until that happens.\n";
+
 /// The `dflow` usage contract injected into every dispatch brief (`adapters.md`
 /// dispatch flow step 6; `agent-cli.md` design rules): how to self-report, maintain the
 /// board, and consult project memory before re-deriving facts.
@@ -3011,17 +3048,14 @@ fn render_recipe_brief_section(recipe: &Recipe) -> String {
         }
     }
 
-    // Honesty note (`recipes.md` bundled deep recipe): plan approval is recipe policy
-    // now, but the daemon cannot hold a session at an unapproved plan until Plan
-    // Studio lands, so the brief says so instead of implying an enforced gate.
+    // Plan review loop protocol (`plan-studio.md` / The loop; `agent-cli.md` / `dflow
+    // plan`). Planning agents are probabilistic, so the brief spells out holding the loop
+    // as the explicit contract: this block is why audit finding #4 (an agent that opened a
+    // plan, backgrounded the poll, and ended its session) does not recur.
     if recipe.has_stage(Stage::Plan)
         && recipe.plan.as_ref().is_some_and(|p| p.approval == dflow_core::recipe::Approval::Required)
     {
-        out.push_str(
-            "Note: this recipe requires plan approval, but daemon-enforced plan gating arrives \
-             with Plan Studio; until then keep the human in the loop through status notes and do \
-             not treat `dflow status done` as plan approval.\n",
-        );
+        out.push_str(PLAN_REVIEW_LOOP_PROTOCOL);
     }
 
     for guidance in &recipe.guidance {
@@ -3366,8 +3400,8 @@ mod tests {
         assert!(minted.excludes.iter().any(|e| e.contains("kill")), "kill is excluded");
     }
 
-    /// The recipe brief section carries identity, stages, budgets, the plan-approval
-    /// honesty note, and the stage-tagged guidance (`recipes.md` / Format).
+    /// The recipe brief section carries identity, stages, budgets, the plan-review-loop
+    /// protocol, and the stage-tagged guidance (`recipes.md` / Format; audit finding #4).
     #[test]
     fn recipe_brief_section_injects_stage_guidance() {
         let catalog = RecipeCatalog::build(None, None);
@@ -3375,8 +3409,14 @@ mod tests {
         let out = render_recipe_brief_section(&standard);
         assert!(out.starts_with("## Flow recipe: standard v1\n"), "got: {out}");
         assert!(out.contains("Stages: plan -> implement -> verify -> ship.\n"));
-        // Plan approval is required but not yet daemon-enforced; the brief says so.
-        assert!(out.contains("daemon-enforced plan gating arrives"), "honesty note missing: {out}");
+        // Plan approval is required, so the imperative hold-the-loop protocol is injected:
+        // it must make a FOREGROUND poll the contract and deny `status done` as approval.
+        assert!(out.contains("in the FOREGROUND and wait"), "plan-loop protocol missing: {out}");
+        assert!(out.contains("re-run `dflow plan open plan.html`"), "re-open step missing: {out}");
+        assert!(
+            out.contains("`dflow status done` is NOT plan approval"),
+            "the status-done disclaimer must be present: {out}"
+        );
         // Stage-tagged guidance from the recipe body is injected under stage headings.
         assert!(out.contains("### plan guidance\n"));
         assert!(out.contains("Keep the artifact to one screen."));
@@ -3394,8 +3434,8 @@ mod tests {
         assert!(out.contains("at most 10 cards and 6 notes"), "budget line missing: {out}");
         assert!(out.contains("### implement guidance\n"));
         assert!(out.contains("scout, not a fixer"));
-        // No plan stage, so no plan-approval note.
-        assert!(!out.contains("plan gating"));
+        // No plan stage, so the plan-review-loop protocol is not injected.
+        assert!(!out.contains("in the FOREGROUND and wait"), "no plan loop for a plan-less recipe: {out}");
     }
 
     /// `done` arbitration answers with the recipe's remaining stages (`agent-cli.md`).

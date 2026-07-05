@@ -11,14 +11,24 @@ HTML artifacts let the planning agent present real structure (columns, diagrams,
 ## The loop
 
 1. The planning agent writes a self-contained `plan.html` into its card's artifact directory.
-2. It calls `dflow plan open plan.html`, then loops on `dflow plan poll` (bounded polls, see agent-cli.md; its session state becomes `awaiting_feedback`, which suspends stuck detection).
+2. It calls `dflow plan open plan.html`, then holds a **foreground** `dflow plan poll` and waits (its session state becomes `awaiting_feedback`, which suspends stuck detection).
 3. The card workspace's Plan tab renders the artifact in a sandboxed iframe inside the app webview with the injected review SDK; the Needs You queue gains a "plan round awaiting feedback" item.
 4. The human explores, annotates, answers embedded controls, and queues feedback; Enter sends the batch.
-5. The poll returns the batch as structured items; the agent revises the artifact in place and polls again.
+5. The poll returns the batch as structured items; the agent revises the artifact in place, re-runs `dflow plan open plan.html` to register the new round, and polls again.
 6. Rounds repeat until the human approves (a first-class Approve action, recorded as `plan_approved`) or ends the session.
 
 Feedback is never lost: queued items persist across GUI reloads and poll interruptions.
 Both `ended` and final responses carry `next_step` guidance so the agent knows to stop polling and proceed in its main channel.
+
+## Poll contract (the loop primitive)
+
+The loop only holds if the agent treats a single foreground `dflow plan poll` as blocking and self-resuming, so the poll is engineered to make that the path of least resistance (this is the fix for audit finding #4, where a planning agent backgrounded the poll and ended its session).
+
+- **Blocking by default**: `dflow plan poll` long-polls server-side and does not return until feedback is queued, the plan is approved/ended, or the bounded budget elapses.
+- **Budget under the default harness tool timeout**: the server-side budget is ~100s, deliberately under the *default* agent-harness command timeout (Claude Code's Bash tool defaults to 120s), not the ~4-minute ceiling. A foreground poll therefore returns cleanly inside the default window instead of being killed mid-wait, which is what previously made the poll look like something to background.
+- **Definitive `next:` on every outcome**: a delivered batch says to revise, re-open, and poll again; `approved`/`ended` say to stop polling and proceed; a budget timeout returns nothing-queued-yet with an explicit instruction to run `dflow plan poll` again in the foreground and not end the session. An agent that runs one foreground poll is carried through the whole loop by these `next:` lines alone.
+- **Re-open is idempotent-and-round-bumping**: `dflow plan open <same file>` after revising is never an error; it bumps the round, mints a fresh revise-in-place nonce (the iframe reloads), and keeps the served `doc_id` stable. Re-opening the revised artifact is the required step between feedback and the next poll.
+- **`awaiting_feedback` on the poll path**: parking on a foreground poll sets the session to `awaiting_feedback`, which suspends tier-3 stuck detection (adapters.md) so a review lasting hours never false-escalates; the state returns to `working` the moment a batch is delivered or the review ends.
 
 ## Review chrome capabilities
 

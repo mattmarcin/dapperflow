@@ -28,6 +28,7 @@ ship:
 Keep the artifact to one screen.
 Lead with the two or three decisions you actually need from the human, and use controls for them.
 Do not over-specify; the point is a fast skim-and-approve, not a design document.
+After you open it, hold a foreground `dflow plan poll` until it returns `approved` - one round is usually enough, but do not end your session before approval.
 
 ## implement
 
