@@ -27,15 +27,23 @@ import {
   GithubImportConfig,
   GithubImportResult,
   GithubIssue,
+  GateMode,
   Lane,
   NeedsYouItem,
+  PlanMode,
+  PrivilegeKind,
   Project,
   ProjectAddResult,
   Recipe,
+  RecipePrivilege,
+  RecipeScope,
   RemoteCapabilityProfile,
   RemoteListenerState,
   Session,
   SessionResumeResult,
+  ShipTarget,
+  StageLine,
+  TrustTier,
 } from "../model";
 import { ArtifactMeta, FeedbackSubmit, FeedbackSubmitResult } from "../review/protocol";
 import { DataSource } from "./source";
@@ -275,13 +283,21 @@ export class LiveDataSource implements DataSource {
   // --- Flow recipes (recipe.list) -------------------------------------------
 
   async listRecipes(): Promise<Recipe[]> {
-    // recipe.list {} -> bundled + user + project recipes with source (protocol.md).
-    // The recipes crate is landing in a parallel lane; until this daemon serves the
-    // verb, fall back to the bundled fixture catalog so the dial stays usable.
-    // INTERPRET: response shape { recipes: Recipe[] } (listed in phase5-m3-ui.md).
+    // recipe.list {} -> bundled + user + project recipes with source + trust tier.
+    // The daemon answers with dflow-proto RecipeSummary rows (name, scope, version,
+    // description, trust_tier, source_path, elevations), NOT the desktop's richer dial
+    // view-model. Passing those raw rows straight to the dial was the crash: RecipeRow
+    // reads recipe.trust and recipe.stageLines, which are undefined on a summary, so the
+    // render threw and (with no error boundary) blanked the app. Normalize every row into
+    // the Recipe shape here. If the verb is unanswered or empty, fall back to the bundled
+    // fixture catalog so the dial stays usable.
     try {
-      const res = await this.client.call<{ recipes?: Recipe[] }>("recipe.list", {});
-      if (Array.isArray(res.recipes) && res.recipes.length > 0) return res.recipes;
+      const res = await this.client.call<{ recipes?: unknown[] }>("recipe.list", {});
+      if (Array.isArray(res.recipes) && res.recipes.length > 0) {
+        return res.recipes
+          .filter((r): r is Record<string, unknown> => !!r && typeof r === "object")
+          .map(normalizeRecipe);
+      }
       return RECIPE_FIXTURES.map((r) => ({ ...r }));
     } catch {
       return RECIPE_FIXTURES.map((r) => ({ ...r }));
@@ -583,4 +599,75 @@ export class LiveDataSource implements DataSource {
 function errorMessage(e: unknown): string {
   if (e && typeof e === "object" && "message" in e) return String((e as { message: unknown }).message);
   return String(e);
+}
+
+// Best-effort human capability kind from a daemon elevation one-liner. The verbatim
+// string is carried through as the privilege detail regardless; the kind only picks the
+// consent-summary label, and the dial renders defensively if it lands off the map.
+function guessPrivilegeKind(detail: string): PrivilegeKind {
+  const d = detail.toLowerCase();
+  if (d.includes("mcp")) return "mcp";
+  if (d.includes("gate")) return "gate_disabled";
+  if (d.includes("in place") || d.includes("in-place") || d.includes("checkout") || d.includes("working tree"))
+    return "worktree_in_place";
+  if (d.includes("merge") || d.includes("local branch") || d.includes("no pr")) return "local_merge";
+  return "mcp";
+}
+
+// Map one recipe.list row (a dflow-proto RecipeSummary, or a richer future shape) into
+// the desktop's Recipe dial view-model, filling every field the dial reads with a safe
+// value. Tolerant of both the summary shape (trust_tier / elevations / source_path) and
+// an already-normalized shape (trust / privileges / stageLines), so a daemon upgrade that
+// serves the full object still works.
+function normalizeRecipe(raw: Record<string, unknown>): Recipe {
+  const name = typeof raw.name === "string" && raw.name.trim() ? raw.name : "recipe";
+  const trustRaw = raw.trust ?? raw.trust_tier;
+  const trust: TrustTier = trustRaw === "privileged" ? "privileged" : "standard";
+  const scopeRaw = raw.scope;
+  const scope: RecipeScope = scopeRaw === "user" || scopeRaw === "project" ? scopeRaw : "bundled";
+  const elevations = Array.isArray(raw.elevations)
+    ? (raw.elevations as unknown[]).filter((e): e is string => typeof e === "string")
+    : [];
+  const privileges: RecipePrivilege[] = Array.isArray(raw.privileges)
+    ? (raw.privileges as unknown[])
+        .filter((p): p is Record<string, unknown> => !!p && typeof p === "object")
+        .map((p) => ({
+          kind: (p.kind as PrivilegeKind) ?? guessPrivilegeKind(String(p.detail ?? "")),
+          detail: typeof p.detail === "string" ? p.detail : String(p.detail ?? ""),
+        }))
+    : elevations.map((detail) => ({ kind: guessPrivilegeKind(detail), detail }));
+  const stageLines: StageLine[] = Array.isArray(raw.stageLines)
+    ? (raw.stageLines as unknown[])
+        .filter((s): s is Record<string, unknown> => !!s && typeof s === "object")
+        .map((s) => ({ stage: String(s.stage ?? ""), note: typeof s.note === "string" ? s.note : "" }))
+    : [];
+  const stages = Array.isArray(raw.stages)
+    ? (raw.stages as unknown[]).map((s) => String(s))
+    : stageLines.map((s) => s.stage);
+  const source =
+    typeof raw.source === "string"
+      ? raw.source
+      : typeof raw.source_path === "string"
+        ? raw.source_path
+        : scope === "bundled"
+          ? "bundled"
+          : scope;
+  return {
+    name,
+    version: typeof raw.version === "number" ? raw.version : 1,
+    description: typeof raw.description === "string" ? raw.description : "",
+    scope,
+    source,
+    stages,
+    stageLines,
+    planMode: (raw.planMode as PlanMode) ?? "none",
+    approval: raw.approval === "required" ? "required" : "auto",
+    gate: (raw.gate as GateMode) ?? "full",
+    shipTarget: (raw.shipTarget as ShipTarget) ?? "pr",
+    trust,
+    privileges,
+    contentHash: typeof raw.contentHash === "string" ? raw.contentHash : "",
+    investigation:
+      typeof raw.investigation === "boolean" ? raw.investigation : /^audit(-deep)?$/.test(name),
+  };
 }

@@ -15,6 +15,7 @@ import { GrantModal } from "./components/GrantModal";
 import { AuditOfferModal } from "./components/AuditOfferModal";
 import { TopBar } from "./components/TopBar";
 import { ConcertmasterPanel } from "./components/concertmaster/ConcertmasterPanel";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 
 export function App() {
   return (
@@ -99,15 +100,20 @@ function Shell() {
         <TopBar />
         <DaemonBanner />
         <div className="stage-body">
-          {store.view === "settings" ? (
-            <SettingsView />
-          ) : store.view === "mission" ? (
-            <MissionControl />
-          ) : (
-            <Board />
-          )}
-          {store.openCardId ? <CardWorkspace /> : null}
-          {store.openSessionId ? <SessionView /> : null}
+          {/* Guard the whole content pane: a render crash in any single view or overlay
+              (e.g. an unexpected data shape) shows an inline, recoverable message here
+              instead of blanking the app. Keyed by the route so navigating recovers. */}
+          <ErrorBoundary resetKey={`${store.view}:${store.openCardId ?? ""}:${store.openSessionId ?? ""}`}>
+            {store.view === "settings" ? (
+              <SettingsView />
+            ) : store.view === "mission" ? (
+              <MissionControl />
+            ) : (
+              <Board />
+            )}
+            {store.openCardId ? <CardWorkspace /> : null}
+            {store.openSessionId ? <SessionView /> : null}
+          </ErrorBoundary>
         </div>
         <StatusBar />
       </main>

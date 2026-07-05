@@ -626,6 +626,51 @@ button:disabled {
   min-height: 0;
 }
 
+/* Error-boundary fallback for the main content pane: fills the stage, centers a calm,
+   recoverable message. The sidebar/top bar/status bar stay live outside it. */
+.view-error {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 40px;
+  background: var(--ink-900);
+  z-index: 4;
+}
+.view-error-inner {
+  max-width: 440px;
+  text-align: center;
+}
+.view-error-mark {
+  color: var(--brass);
+  margin-bottom: 14px;
+}
+.view-error-title {
+  margin: 0 0 8px;
+  font-family: var(--font-ui);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+}
+.view-error-detail {
+  margin: 0 0 14px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-dim);
+}
+.view-error-msg {
+  margin: 0 0 22px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--ink-850);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--danger);
+  word-break: break-word;
+}
+
 .daemon-banner {
   display: flex;
   align-items: center;

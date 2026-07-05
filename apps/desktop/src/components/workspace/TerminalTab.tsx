@@ -45,8 +45,19 @@ export function TerminalTab({ card, sessions }: Props) {
     try {
       if (opts?.dispatch) {
         // A true dispatch: advance the card through the protocol (lane move to
-        // Performing, dispatched/moved events) before opening its terminal.
-        await store.dispatch({ card_id: card.id, harness });
+        // Performing, dispatched/moved events), then open the live CLI it launched.
+        // dispatch.start leases a worktree and returns the session id; attach THAT
+        // session's terminal here through the same pool + attach flow New Session uses,
+        // so the dispatched CLI appears right in this tab (product.md: "opens right
+        // here"). Spawning a separate shell was the bug - it hid the real session.
+        const sid = await store.dispatch({ card_id: card.id, harness });
+        if (sid) {
+          store.bindTerminal(card.id, sid, harness);
+          setActive(sid);
+          return;
+        }
+        // No session id (an older daemon): fall through and open a terminal directly so
+        // the tab is never left empty.
       }
       const sid = await store.startTerminal(card.id, harness);
       setActive(sid);
