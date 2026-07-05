@@ -17,7 +17,7 @@ const STATUS_LABEL: Record<string, string> = {
 // unkillable.
 export function StatusBar() {
   const store = useStore();
-  const { daemon, daemonPort, daemonVersion, daemonStarted, daemonMode, cards, sessions, launches, fixtureMode } =
+  const { daemon, daemonPort, daemonVersion, daemonStarted, daemonMode, cards, sessions, launches, dataMode } =
     store;
   const { openMenu } = useContextMenu();
   const [confirmStop, setConfirmStop] = useState(false);
@@ -60,7 +60,11 @@ export function StatusBar() {
       <Segment label="cards" value={String(cards.length)} />
       <Segment label="live" value={String(liveCount)} muted={liveCount === 0} />
       <span className="status-spacer" />
-      {fixtureMode ? <span className="status-fixture">fixture data</span> : null}
+      {dataMode === "fixture" ? (
+        <span className="status-fixture" title="Dev fixtures (VITE_DFLOW_FIXTURES): this board is demo data, not a live daemon.">
+          demo data (fixtures)
+        </span>
+      ) : null}
       {daemonMode === "dev-external" ? (
         <span className="status-mode" title="Development: the app connects to an externally-run daemon (just daemon-dev)">
           dev daemon

@@ -69,6 +69,16 @@ export interface SessionAttached {
   replay_base64: string;
 }
 
+// session.peek response (dflow-proto SessionPeeked): a read-only, bounded, scrubbed
+// plain-text screen capture. `lines` is the COUNT of lines returned; `text` is the
+// visible-screen tail as plain text with secret values redacted. This is the phone's
+// read-only peek - session.attach is forbidden in the phone scope.
+export interface SessionPeeked {
+  session_id: string;
+  lines: number;
+  text: string;
+}
+
 // Binary frame kinds ([u8 kind][16-byte session id][bytes...]). The phone decodes
 // output frames only to drop them: the peek re-reads a fresh snapshot on a poll,
 // it never streams the live PTY, and it never encodes input or resize.

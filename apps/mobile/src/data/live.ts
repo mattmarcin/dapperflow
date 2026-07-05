@@ -10,7 +10,7 @@
 // still lights up fleet.status and session.attach (the VERIFY targets).
 
 import { DflowMobileClient } from "../client/client";
-import { Envelope, SessionAttached } from "../client/protocol";
+import { Envelope, SessionPeeked, StyledRun } from "../client/protocol";
 import { Card, FleetSnapshot, NeedsYouItem, Project, Session } from "../client/model";
 import { ActionResult, MobileDataSource, TerminalPeek } from "./source";
 
@@ -22,7 +22,6 @@ interface WireSessionSummary {
   harness: string;
   agent?: string | null;
   title?: string | null;
-  model?: string | null;
   state: string;
   alive: boolean;
   elapsed_ms: number;
@@ -37,7 +36,6 @@ interface WireNeedsYouItem {
   dedupe_key: string;
   score: number;
   raised_at: number;
-  note?: string | null;
 }
 
 interface WireCard {
@@ -58,7 +56,9 @@ function sessionFromWire(w: WireSessionSummary): Session {
     harness: w.harness,
     agent: w.agent ?? null,
     title: w.title ?? null,
-    model: w.model ?? null,
+    // SessionSummary carries no `model` field; the phone strip leaves it null rather than
+    // reading a key the daemon never sends.
+    model: null,
     state: w.state,
     first_prompt: w.first_prompt ?? null,
     // v0 wire carries elapsed-since-creation only; state-transition timestamps arrive
@@ -71,6 +71,10 @@ function sessionFromWire(w: WireSessionSummary): Session {
 
 export class LiveMobileSource implements MobileDataSource {
   readonly mode = "live" as const;
+
+  // needs_you.resolve needs { card_id, dedupe_key }, but the views dismiss by item id, so
+  // index the open items from the last fleet snapshot to recover the resolve key on dismiss.
+  private readonly needsYouIndex = new Map<string, { card_id: string; dedupe_key: string }>();
 
   constructor(private readonly client: DflowMobileClient) {}
 
@@ -86,38 +90,46 @@ export class LiveMobileSource implements MobileDataSource {
       .then((r) => r.cards.map(cardFromWire))
       .catch(() => [] as Card[]);
 
-    const projects = await this.client
-      .call<{ projects: Project[] }>("project.list", {})
-      .then((r) => r.projects)
-      .catch(() => [] as Project[]);
-
     const sessions = (fleet.sessions ?? []).map(sessionFromWire);
+
+    // project.list is NOT in the phone scope (dispatch_phone routes no project verbs), so
+    // calling it would only ever be forbidden. Source project names from the session rows
+    // (fleet.status joins project_name), which is all the phone deep links need.
+    const projects = projectsFromSessions(sessions);
+
+    this.needsYouIndex.clear();
     const needsYou = (fleet.needs_you ?? [])
-      .map(
-        (w): NeedsYouItem => ({
+      .map((w): NeedsYouItem => {
+        this.needsYouIndex.set(w.id, { card_id: w.card_id, dedupe_key: w.dedupe_key });
+        return {
           id: w.id,
           card_id: w.card_id,
           kind: w.kind,
           dedupe_key: w.dedupe_key,
           score: w.score,
           raised_at: w.raised_at,
-          note: w.note ?? null,
-        }),
-      )
+          // NeedsYouItem has no `note` field on the wire; leave it null.
+          note: null,
+        };
+      })
       .sort((a, b) => b.score - a.score);
 
     return { projects, cards, sessions, needsYou };
   }
 
   async peekSession(sessionId: string): Promise<TerminalPeek> {
-    // session.attach replays a styled snapshot, then the client immediately detaches:
-    // read-only, no live stream, no input (the phone never holds a PTY).
-    const attached: SessionAttached = await this.client.peek(sessionId, 80, 24);
+    // session.peek returns SessionPeeked { session_id, lines, text }: a scrubbed, bounded
+    // PLAIN-TEXT screen tail (no styled snapshot, no attach). Split the text into unstyled
+    // runs for the peek renderer. `lines` is the returned line count; cols is the widest
+    // line. Read-only: no live stream, no input (session.attach is forbidden on the phone).
+    const peeked: SessionPeeked = await this.client.peek(sessionId, 40);
+    const textLines = peeked.text.split("\n");
+    const lines: StyledRun[][] = textLines.map((line) => [{ text: line }]);
     return {
       sessionId,
-      cols: attached.snapshot.cols,
-      rows: attached.snapshot.rows,
-      lines: attached.snapshot.lines,
+      cols: textLines.reduce((max, line) => Math.max(max, line.length), 0) || 80,
+      rows: peeked.lines || textLines.length,
+      lines,
       capturedAt: Date.now(),
       // The daemon scrubs known secret values from any capture that leaves a session
       // (security.md); the phone trusts that scrub and never requests raw scrollback.
@@ -126,32 +138,43 @@ export class LiveMobileSource implements MobileDataSource {
   }
 
   async getPlan(cardId: string): Promise<PlanArtifactOrNull> {
-    // INTERPRET: card.get returns the card plus its artifacts (protocol.md). Find the
-    // plan artifact, then artifact.get for the served HTML + layout audit. The phone
-    // renders that document read-only; approve + one comment are the only writes.
+    // card.get returns the card plus its ArtifactMeta[] (protocol.md). Find the plan
+    // artifact, then artifact.get -> ArtifactGetResult { artifact, signed_url, expires_at,
+    // layout_warnings: LayoutWarning[] }. There is NO inline html: fetch the document over
+    // the short-lived signed URL. The round lives on `artifact.round`, and layout_warnings
+    // are structured objects (not strings), so summarize each into a one-line label.
     try {
       const got = await this.client.call<{
         card?: WireCard;
-        artifacts?: { id: string; kind: string }[];
+        artifacts?: { id: string; kind: string; round?: number }[];
       }>("card.get", { card_id: cardId });
       const planArtifact = (got.artifacts ?? []).find((a) => a.kind === "plan");
       if (!planArtifact) return null;
       const doc = await this.client.call<{
-        html?: string;
-        layout_warnings?: string[];
-        round?: number;
+        artifact: { id: string; round: number };
+        signed_url: string;
+        expires_at: number;
+        layout_warnings?: WireLayoutWarning[];
       }>("artifact.get", { artifact_id: planArtifact.id });
+      let html: string | null = null;
+      try {
+        const res = await fetch(doc.signed_url);
+        if (res.ok) html = await res.text();
+      } catch {
+        // The signed artifact endpoint may be unreachable; fall back to the structured view.
+        html = null;
+      }
       return {
         id: planArtifact.id,
         card_id: cardId,
         card_title: got.card?.title ?? "Plan",
         project_name: null,
-        round: doc.round ?? 1,
+        round: doc.artifact?.round ?? 1,
         status: "awaiting_review",
         summary: "",
         sections: [],
-        html: doc.html ?? null,
-        layoutWarnings: doc.layout_warnings ?? [],
+        html,
+        layoutWarnings: (doc.layout_warnings ?? []).map(layoutWarningLabel),
       };
     } catch {
       // Artifact endpoints not present yet: the view falls back to its fixture plan.
@@ -160,11 +183,13 @@ export class LiveMobileSource implements MobileDataSource {
   }
 
   async approvePlan(planId: string, feedback: string): Promise<ActionResult> {
-    // INTERPRET: artifact.feedback.submit carries the review batch (plan-studio.md).
-    // v1 phone review = one approve item plus one overall comment when provided.
+    // artifact.feedback.submit carries the review batch (plan-studio.md). The valid
+    // FeedbackItem kinds are text_range|control|diagram_node|action|chat|element - NOT
+    // "approve"/"comment". Approve is an `action` item (approve_plan); the overall note is
+    // a `chat` item whose body is the feedback. The old kinds were silently dropped.
     try {
-      const items: Record<string, unknown>[] = [{ kind: "approve" }];
-      if (feedback.trim()) items.push({ kind: "comment", scope: "overall", text: feedback.trim() });
+      const items: Record<string, unknown>[] = [{ kind: "action", action: "approve_plan" }];
+      if (feedback.trim()) items.push({ kind: "chat", body: feedback.trim() });
       await this.client.call("artifact.feedback.submit", { artifact_id: planId, items });
       return { ok: true };
     } catch (e) {
@@ -172,19 +197,37 @@ export class LiveMobileSource implements MobileDataSource {
     }
   }
 
-  async dismissNeedsYou(_itemId: string): Promise<ActionResult> {
-    // No dedicated resolve verb exists yet: resolution happens on the resolving surface
-    // (approve, merge, answer). Dismiss is therefore an optimistic client-side removal;
-    // the daemon reconciles the true state on the next fleet.status. Documented debt.
-    void _itemId;
-    return { ok: true };
+  async dismissNeedsYou(itemId: string): Promise<ActionResult> {
+    // dispatch_phone DOES route needs_you.resolve { card_id, dedupe_key }, so actually
+    // resolve the item instead of only optimistically dropping it (which let dismissed
+    // items reappear on the next fleet.status). The views dismiss by item id; recover the
+    // resolve key from the last fleet snapshot's index.
+    const key = this.needsYouIndex.get(itemId);
+    if (!key) {
+      // Not in the current snapshot (already resolved elsewhere): treat as done so the UI
+      // does not get stuck; the next fleet.status reconciles.
+      return { ok: true };
+    }
+    try {
+      await this.client.call("needs_you.resolve", {
+        card_id: key.card_id,
+        dedupe_key: key.dedupe_key,
+      });
+      this.needsYouIndex.delete(itemId);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: errorMessage(e) };
+    }
   }
 
   subscribeEvents(handler: () => void): () => void {
     const prev = this.client.onEvent;
     this.client.onEvent = (env: Envelope) => {
       prev?.(env);
-      const ev = env.payload as { kind?: string } | undefined;
+      // event.subscribe delivers Envelope::event("event.card_event", EventCardEvent
+      // { event }), so the card_event row is NESTED under `payload.event`. Reading it flat
+      // left `kind` undefined and the store never re-pulled on live updates.
+      const ev = (env.payload as { event?: { kind?: string } } | undefined)?.event;
       // Any card_event may change the fleet or the queue; the store re-pulls on notify.
       if (ev && ev.kind) handler();
     };
@@ -204,6 +247,37 @@ function cardFromWire(w: WireCard): Card {
     lane: w.lane ?? "inbox",
     priority: w.priority ?? 0,
   };
+}
+
+// A layout-audit finding (dflow-proto LayoutWarning): structured, not a string.
+interface WireLayoutWarning {
+  selector: string;
+  kind: string;
+  overflow_px?: number;
+  viewport_width?: number;
+  severity: string;
+}
+
+// Summarize a layout warning into the one-line label the phone review view joins.
+function layoutWarningLabel(w: WireLayoutWarning): string {
+  const kind = w.kind.replace(/_/g, " ");
+  return w.selector ? `${kind} at ${w.selector}` : kind;
+}
+
+// Derive the projects the phone needs (id + name for deep-link context) from the session
+// rows, since project.list is not in the phone scope. Path is unknown from a session row.
+function projectsFromSessions(sessions: Session[]): Project[] {
+  const byId = new Map<string, Project>();
+  for (const s of sessions) {
+    if (s.project_id && !byId.has(s.project_id)) {
+      byId.set(s.project_id, {
+        id: s.project_id,
+        name: s.project_name ?? s.project_id,
+        path: "",
+      });
+    }
+  }
+  return [...byId.values()];
 }
 
 function errorMessage(e: unknown): string {
