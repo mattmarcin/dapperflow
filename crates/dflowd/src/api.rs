@@ -1684,15 +1684,24 @@ fn resolve_knowledge_dir(
     Ok(Some((dir, project.name)))
 }
 
-/// The project a `know.*` request targets: the explicit `project_id` (root clients) or
-/// the token's project (agent clients). Errors when neither is available.
+/// The project a `know.*` request targets.
+///
+/// A scoped agent token is confined to its own project: its `project_id` wins and any
+/// client-supplied `explicit` value is ignored, so a leaked task/cardless token cannot
+/// read or write another project's knowledge base (`security.md`: a leaked task token
+/// cannot touch other projects). Only a non-agent (root) client may target an explicit
+/// project. Errors when neither a token project nor, for root, an explicit project exists.
 fn know_project(
     token: Option<&AgentToken>,
     explicit: Option<String>,
 ) -> Result<String, ProtocolError> {
-    explicit
-        .or_else(|| token.and_then(|t| t.project_id.clone()))
-        .ok_or_else(|| ProtocolError::bad_request("no project in scope for a knowledge verb"))
+    match token.and_then(|t| t.project_id.clone()) {
+        // Agent token: confined to its own project; explicit is ignored, not trusted.
+        Some(scoped) => Ok(scoped),
+        // Root/non-agent client: may target an explicit project.
+        None => explicit
+            .ok_or_else(|| ProtocolError::bad_request("no project in scope for a knowledge verb")),
+    }
 }
 
 /// `know.index {}`: digest + catalog counts (`dflow know`).
@@ -3147,8 +3156,46 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokens::{TokenRegistry, TokenScope};
     use dflow_core::recipe::RecipeCatalog;
     use dflow_core::{DataDir, NewSession};
+
+    fn project_scoped_token(project: &str) -> std::sync::Arc<crate::tokens::AgentToken> {
+        let reg = TokenRegistry::default();
+        let (_s, handle) = reg.mint(TokenScope {
+            card_id: None,
+            project_id: Some(project.to_string()),
+            audit: false,
+            budget_cards: None,
+            budget_notes: None,
+            recipe: None,
+            gate_run_id: None,
+        });
+        handle
+    }
+
+    #[test]
+    fn know_project_confines_an_agent_token_to_its_own_project() {
+        // A scoped agent token supplies a FOREIGN project explicitly; the daemon must
+        // ignore it and use the token's own project (security.md: a leaked task token
+        // cannot touch other projects). This is the regression guard for the audit's
+        // cross-project knowledge escape.
+        let tok = project_scoped_token("proj-A");
+        let got = know_project(Some(&tok), Some("proj-B".to_string()))
+            .expect("a scoped token always resolves to its own project");
+        assert_eq!(got, "proj-A", "explicit foreign project_id must be ignored for an agent token");
+
+        // With no explicit project, the token still resolves to its own.
+        assert_eq!(know_project(Some(&tok), None).unwrap(), "proj-A");
+    }
+
+    #[test]
+    fn know_project_lets_a_root_client_target_an_explicit_project() {
+        // A non-agent (root) client has no token; it may target any project explicitly.
+        assert_eq!(know_project(None, Some("proj-B".to_string())).unwrap(), "proj-B");
+        // Root with no explicit project is a bad request (nothing to target).
+        assert!(know_project(None, None).is_err());
+    }
 
     #[test]
     fn standing_guidance_splices_claude_system_prompt_flag() {
