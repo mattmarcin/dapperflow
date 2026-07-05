@@ -368,22 +368,40 @@ impl Store {
     /// Finalize a session that ended during this run: set `state`, stamp `ended_at`,
     /// append `session_ended`.
     pub fn finalize_session(&self, id: &str, state: &str) -> Result<(), StoreError> {
+        self.finalize_session_note(id, state, None)
+    }
+
+    /// Like [`finalize_session`] but records a status note on the row and in the
+    /// `session_ended` event, used to carry the direct child's exit code when the session
+    /// self-terminates (`architecture.md` / session exit; audit finding #5).
+    pub fn finalize_session_note(
+        &self,
+        id: &str,
+        state: &str,
+        note: Option<&str>,
+    ) -> Result<(), StoreError> {
         let row = self
             .get_session(id)?
             .ok_or_else(|| StoreError::NotFound(format!("session {id}")))?;
         let ts = now_ms();
         self.tx_events(|tx, events| {
-            tx.execute(
-                "UPDATE sessions SET state = ?2, ended_at = COALESCE(ended_at, ?3) WHERE id = ?1",
-                params![id, state, ts],
-            )?;
+            match note {
+                Some(n) => tx.execute(
+                    "UPDATE sessions SET state = ?2, status_note = ?4, ended_at = COALESCE(ended_at, ?3) WHERE id = ?1",
+                    params![id, state, ts, n],
+                )?,
+                None => tx.execute(
+                    "UPDATE sessions SET state = ?2, ended_at = COALESCE(ended_at, ?3) WHERE id = ?1",
+                    params![id, state, ts],
+                )?,
+            };
             if let Some(card_id) = &row.card_id {
                 append_event(
                     tx,
                     events,
                     card_id,
                     event_kind::SESSION_ENDED,
-                    serde_json::json!({ "session_id": id, "state": state, "from": row.state }),
+                    serde_json::json!({ "session_id": id, "state": state, "from": row.state, "note": note }),
                 )?;
             }
             Ok(())
