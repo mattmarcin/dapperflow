@@ -20,16 +20,21 @@ import {
   Card,
   CardCreateInput,
   CardEvent,
+  CardType,
   DispatchStartInput,
   FindingResolution,
+  GateFinding,
   GateRun,
+  GateStatus,
   GithubAuthStatus,
   GithubImportConfig,
   GithubImportResult,
   GithubIssue,
+  GithubLabel,
   GateMode,
   Lane,
   NeedsYouItem,
+  PairedDevice,
   PlanMode,
   PrivilegeKind,
   Project,
@@ -66,7 +71,6 @@ interface WireSessionSummary {
   alive: boolean;
   elapsed_ms: number;
   resume_ref?: string | null;
-  resumed_from?: string | null;
   first_prompt?: string | null;
   created_at_ms: number;
 }
@@ -81,7 +85,6 @@ interface WireNeedsYouItem {
   score: number;
   raised_at: number;
   notified_at?: number | null;
-  note?: string | null;
 }
 
 function sessionFromWire(w: WireSessionSummary): Session {
@@ -100,7 +103,9 @@ function sessionFromWire(w: WireSessionSummary): Session {
     state: w.state as Session["state"],
     first_prompt: w.first_prompt ?? null,
     resume_ref: w.resume_ref ?? null,
-    resumed_from: w.resumed_from ?? null,
+    // SessionSummary carries no `resumed_from` (that field lives on SessionResumed, the
+    // session.resume response). The fleet row never sends it, so it is always null here.
+    resumed_from: null,
     created_at: w.created_at_ms,
     ended_at: null,
     // v0: the wire carries elapsed-since-creation only; state transition
@@ -121,12 +126,19 @@ function needsYouFromWire(w: WireNeedsYouItem): NeedsYouItem {
     score: w.score,
     raised_at: w.raised_at,
     notified_at: w.notified_at ?? null,
-    note: w.note ?? null,
+    // NeedsYouItem has no `note` field on the wire; leave it null rather than reading a
+    // key the daemon never sends.
+    note: null,
   };
 }
 
 export class LiveDataSource implements DataSource {
   readonly mode = "live" as const;
+
+  // Per-project GitHub import filters. The daemon has no field or verb to persist these
+  // (project.get is not routed, and `github_import` is not a ProjectUpdate field), so
+  // they are held client-side for the app session. Deferred until a daemon field exists.
+  private readonly githubImportConfigs = new Map<string, GithubImportConfig>();
 
   constructor(private readonly client: DflowClient) {}
 
@@ -148,12 +160,18 @@ export class LiveDataSource implements DataSource {
 
   async resumeSession(sessionId: string): Promise<SessionResumeResult> {
     try {
-      // session.resume relaunches the harness in the same worktree; the daemon
-      // returns the new session id and records lineage via resumed_from.
-      const res = await this.client.call<{ new_session_id: string }>("session.resume", {
+      // session.resume relaunches the harness in the same worktree; the daemon returns
+      // SessionResumed { session_id, resumed_from, resume_ref? } - the NEW session id is
+      // `session_id` (not `new_session_id`, which the spec wrongly named and the UI
+      // followed). resumed_from/resume_ref are lineage the daemon records.
+      const res = await this.client.call<{
+        session_id: string;
+        resumed_from?: string;
+        resume_ref?: string;
+      }>("session.resume", {
         session_id: sessionId,
       });
-      return { ok: true, new_session_id: res.new_session_id };
+      return { ok: true, new_session_id: res.session_id };
     } catch (e) {
       // A daemon that cannot resume this harness by id answers with an unsupported /
       // unknown-verb error; the UI then disables the action with a tooltip rather than
@@ -350,25 +368,39 @@ export class LiveDataSource implements DataSource {
   }
 
   async approvePlan(artifactId: string, cardId: string): Promise<void> {
-    // INTERPRET: approval is a first-class feedback action (plan-studio.md records
-    // plan_approved); modeled as an `action` item until the daemon names a verb.
+    // Approval is a first-class feedback action (plan-studio.md records plan_approved),
+    // modeled as an `{ kind:"action", action:"approve_plan" }` FeedbackItem. FeedbackSubmit
+    // has no `card_id` field (the artifact_id resolves the card), so it is not sent.
+    void cardId;
     await this.client.call("artifact.feedback.submit", {
       artifact_id: artifactId,
-      card_id: cardId,
-      items: [{ kind: "action", action: "approve_plan", body: null }],
+      items: [{ kind: "action", action: "approve_plan" }],
     });
   }
 
   // --- Onboarding audit ------------------------------------------------------
 
   async startAudit(projectId: string, depth: AuditDepth): Promise<AuditStartResult> {
-    // The audit is a normal dispatch of the bundled audit / audit-deep recipe
-    // (product.md: the recipe has no ship stage, structurally). No card: the audit
-    // files its own cards. INTERPRET: dispatch.start with project_id and no card_id.
+    // The audit is a dispatch of the bundled audit / audit-deep recipe (product.md: the
+    // recipe has no ship stage, structurally). DispatchStart requires a `card_id` and has
+    // NO project-level form - there is no card-less dispatch verb. So the audit runs as a
+    // two-step, entirely frontend-side with existing verbs: create an anchor investigation
+    // card for the run, then dispatch.start against it with `audit: true` (which mints an
+    // audit-scoped token so the cards it files land in Inbox and it may not move lanes).
+    const recipe = depth === "deep" ? "audit-deep" : "audit";
     try {
-      const res = await this.client.call<{ session_id?: string }>("dispatch.start", {
+      const created = await this.client.call<{ card_id?: string; card?: Card }>("card.create", {
+        title: depth === "deep" ? "Onboarding audit (deep)" : "Onboarding audit",
+        type: "investigation",
         project_id: projectId,
-        recipe: depth === "deep" ? "audit-deep" : "audit",
+        dial_recipe: recipe,
+      });
+      const cardId = created.card_id ?? created.card?.id;
+      if (!cardId) return { ok: false, error: "card.create returned no card id for the audit" };
+      const res = await this.client.call<{ session_id?: string }>("dispatch.start", {
+        card_id: cardId,
+        recipe,
+        audit: true,
       });
       return { ok: true, session_id: res.session_id };
     } catch (e) {
@@ -382,14 +414,30 @@ export class LiveDataSource implements DataSource {
 
   async githubAuthStatus(): Promise<GithubAuthStatus> {
     try {
-      const res = await this.client.call<Partial<GithubAuthStatus>>("github.auth.status", {});
+      // GithubAuthResult { present, authenticated, account?, host?, repo? }. The UI's
+      // view-model names differ (gh_present/user), and `scopes`/`setup_hint` are not on
+      // the wire at all, so map present->gh_present, account->user, and compute the setup
+      // hint locally from presence/auth rather than reading absent keys.
+      const res = await this.client.call<{
+        present?: boolean;
+        authenticated?: boolean;
+        account?: string | null;
+        host?: string | null;
+        repo?: string | null;
+      }>("github.auth.status", {});
+      const present = res.present ?? false;
+      const authenticated = res.authenticated ?? false;
       return {
-        gh_present: res.gh_present ?? false,
-        authenticated: res.authenticated ?? false,
-        user: res.user ?? null,
+        gh_present: present,
+        authenticated,
+        user: res.account ?? null,
         host: res.host ?? null,
-        scopes: res.scopes ?? [],
-        setup_hint: res.setup_hint ?? null,
+        scopes: [],
+        setup_hint: authenticated
+          ? null
+          : present
+            ? "Run 'gh auth login' to enable GitHub features. Without it, PR mode degrades cleanly to local-only."
+            : "GitHub features need the gh CLI. Install it and run 'gh auth login'.",
       };
     } catch (e) {
       // A daemon without the gh transport (pre-M5) answers unknown-verb: report gh as
@@ -403,53 +451,63 @@ export class LiveDataSource implements DataSource {
   }
 
   async getGithubImportConfig(projectId: string): Promise<GithubImportConfig> {
-    // INTERPRET: the import filters live on the project row (project.update github block).
-    // Until the daemon serves that field, read a safe default (phase12-m5ui.md).
-    try {
-      const res = await this.client.call<{ github_import?: GithubImportConfig }>("project.get", {
-        project_id: projectId,
-      });
-      const g = res.github_import;
-      if (g) return { assignees: g.assignees ?? [], labels: g.labels ?? [], milestone: g.milestone ?? null, state: g.state ?? "open" };
-    } catch {
-      /* fall through to the default */
-    }
-    return { assignees: [], labels: [], milestone: null, state: "open" };
+    // Deferred: `project.get` is not routed by the daemon, and the Project entity has no
+    // import-config field, so there is nothing to read server-side. The filters are held
+    // client-side (see `githubImportConfigs`) until a daemon field exists.
+    return (
+      this.githubImportConfigs.get(projectId) ?? {
+        assignees: [],
+        labels: [],
+        milestone: null,
+        state: "open",
+      }
+    );
   }
 
   async setGithubImportConfig(projectId: string, config: GithubImportConfig): Promise<GithubImportConfig> {
-    try {
-      await this.client.call("project.update", { project_id: projectId, github_import: config });
-    } catch {
-      /* the daemon may not persist this yet; the UI keeps it for the session */
-    }
+    // Deferred: `github_import` is not a `ProjectUpdate` field and there is no dedicated
+    // verb, so persisting it server-side is impossible today. Keep it client-side for the
+    // session rather than firing a project.update the daemon would silently drop.
+    this.githubImportConfigs.set(projectId, config);
     return config;
   }
 
   async previewGithubIssues(projectId: string): Promise<GithubIssue[]> {
-    // github.issues.preview { project_id } -> the filtered list without importing.
+    // github.issues.preview { project_id, filter } -> GithubIssuesPreviewResult
+    // { repo, issues: GithubIssuePreview[] }. Each preview row is { number, title,
+    // labels: string[], state, url, dedupe, existing_card_id? } - not a full GithubIssue -
+    // so map it into the view-model and surface dedupe/existing_card_id as the import badge.
     try {
-      const res = await this.client.call<{ issues?: GithubIssue[] }>("github.issues.preview", {
-        project_id: projectId,
-      });
-      return res.issues ?? [];
+      const res = await this.client.call<{ repo?: string; issues?: WireGithubIssuePreview[] }>(
+        "github.issues.preview",
+        { project_id: projectId, filter: filterFromConfig(this.githubImportConfigs.get(projectId)) },
+      );
+      const repo = res.repo ?? "";
+      return (res.issues ?? []).map((row) => githubIssueFromPreview(row, repo));
     } catch {
       return [];
     }
   }
 
   async importGithubIssues(projectId: string, numbers: number[]): Promise<GithubImportResult> {
-    // github.issues.import { project_id, numbers? } -> creates/refreshes origin cards.
+    // github.issues.import { project_id, filter: { numbers? }, dial_recipe? } -> creates/
+    // refreshes origin cards. The selection nests under `filter.numbers` (a top-level
+    // `numbers` is dropped, which would import the whole default filter). The response is
+    // GithubIssuesImportResult { repo, results: [{ number, title, card_id, outcome }] };
+    // fold each outcome (created/refreshed/suppressed) into the view-model's counts.
     try {
-      const res = await this.client.call<Partial<GithubImportResult>>("github.issues.import", {
-        project_id: projectId,
-        numbers: numbers.length > 0 ? numbers : undefined,
-      });
+      const filter =
+        numbers.length > 0 ? { numbers } : filterFromConfig(this.githubImportConfigs.get(projectId));
+      const res = await this.client.call<{ repo?: string; results?: WireGithubImportRow[] }>(
+        "github.issues.import",
+        { project_id: projectId, filter },
+      );
+      const results = res.results ?? [];
       return {
-        ok: res.ok ?? true,
-        imported: res.imported ?? 0,
-        refreshed: res.refreshed ?? 0,
-        card_ids: res.card_ids ?? [],
+        ok: true,
+        imported: results.filter((r) => r.outcome === "created").length,
+        refreshed: results.filter((r) => r.outcome === "refreshed").length,
+        card_ids: results.map((r) => r.card_id),
       };
     } catch (e) {
       return { ok: false, imported: 0, refreshed: 0, card_ids: [], error: errorMessage(e) };
@@ -458,13 +516,14 @@ export class LiveDataSource implements DataSource {
 
   async getGithubIssueForCard(card: Card): Promise<GithubIssue | null> {
     if (card.origin_kind !== "github_issue" || !card.origin_ref) return null;
-    // INTERPRET: github.issues.get { origin_ref } once the daemon caches issue bodies;
-    // absent verb degrades to no rendered issue (the Issue tab shows its link-out).
+    // github.issue.get { card_id } (singular verb) -> { issue: GithubIssueInfo }. The old
+    // code called the non-routed plural `github.issues.get` with `origin_ref`; the daemon
+    // resolves the issue from the card id instead.
     try {
-      const res = await this.client.call<{ issue?: GithubIssue }>("github.issues.get", {
-        origin_ref: card.origin_ref,
+      const res = await this.client.call<{ issue?: WireGithubIssueInfo }>("github.issue.get", {
+        card_id: card.id,
       });
-      return res.issue ?? null;
+      return res.issue ? githubIssueFromInfo(res.issue, card) : null;
     } catch {
       return null;
     }
@@ -475,14 +534,17 @@ export class LiveDataSource implements DataSource {
   // returns null (the Verify tab shows its empty state) and mutations reject honestly.
 
   async getGateRun(cardId: string): Promise<GateRun | null> {
-    // INTERPRET: card.get { card_id } -> { gate_run?: GateRun } once the gate engine lands.
+    // gate.status { card_id } -> { run?: GateRunInfo, findings: FindingInfo[] }. `card.get`
+    // carries no gate fields (card/sessions/events/artifacts only), which is why the old
+    // read always fell to null. GateRunInfo uses `step`/`gate_strictness` (not the UI's
+    // mode/checks/pr), so map it into the view-model; no run means "not verified yet".
     try {
-      const res = await this.client.call<{ gate_run?: GateRun | null; gate_runs?: GateRun[] }>("card.get", {
-        card_id: cardId,
-      });
-      if (res.gate_run) return res.gate_run;
-      const list = res.gate_runs ?? [];
-      return list.sort((a, b) => b.updated_at - a.updated_at)[0] ?? null;
+      const res = await this.client.call<{ run?: WireGateRunInfo | null; findings?: WireFindingInfo[] }>(
+        "gate.status",
+        { card_id: cardId },
+      );
+      if (!res.run) return null;
+      return gateRunFromWire(res.run, res.findings ?? []);
     } catch {
       return null;
     }
@@ -499,11 +561,14 @@ export class LiveDataSource implements DataSource {
   }
 
   async resolveGateFinding(cardId: string, findingId: string, resolution: FindingResolution): Promise<GateRun> {
-    // gate.resolve_finding { finding_id, resolution } (gate.md step 4; the findings review
-    // renders in Plan Studio chrome). No card_id in the payload. Re-reads the run after.
+    // gate.resolve_finding { finding_id, resolution } (gate.md step 4). The daemon's
+    // resolution vocabulary is accepted|fixed|skipped, not the UI's approve|fix|skip, so
+    // translate before sending. Then re-read via gate.status (getGateRun), NOT card.get,
+    // which has no gate fields - reading it there is why this used to throw after a
+    // successful resolve.
     await this.client.call("gate.resolve_finding", {
       finding_id: findingId,
-      resolution,
+      resolution: resolutionToDaemon(resolution),
     });
     const run = await this.getGateRun(cardId);
     if (!run) throw new Error("gate run unavailable after resolve");
@@ -525,14 +590,6 @@ export class LiveDataSource implements DataSource {
   // unavailable (the pairing screen marks the integration seam); nothing is fabricated.
 
   private disabledRemote(): RemoteListenerState {
-    const profile: RemoteCapabilityProfile = {
-      needs_you: true,
-      approvals: true,
-      steering: true,
-      terminals_read_only: true,
-      vault_access: false,
-      recipe_install: false,
-    };
     return {
       enabled: false,
       lan_ip: null,
@@ -541,39 +598,62 @@ export class LiveDataSource implements DataSource {
       pairing_payload: null,
       token: null,
       minted_at: null,
-      profile,
+      profile: phoneProfile(),
       devices: [],
     };
   }
 
   async getRemoteState(): Promise<RemoteListenerState> {
+    // daemon.lan.status {} -> LanState { enabled, bound, port, lan_urls, caveat, phones }.
+    // The old `remote.status` verb is not routed. A plain status carries no fresh pairing
+    // payload (that is minted only by daemon.lan.pair), so the QR appears after enabling
+    // or rotating, not on a bare read.
     try {
-      const res = await this.client.call<RemoteListenerState>("remote.status", {});
-      return res;
+      const res = await this.client.call<WireLanState>("daemon.lan.status", {});
+      return lanStateToRemote(res);
     } catch {
       return this.disabledRemote();
     }
   }
 
   async setRemoteEnabled(enabled: boolean): Promise<RemoteListenerState> {
+    // daemon.lan.enable { port? } / daemon.lan.disable {} (the old `remote.listener` verb
+    // is not routed). Enabling also mints one pairing (daemon.lan.pair) so the Settings
+    // screen has a QR to show immediately; disabling just stops the listener.
     try {
-      return await this.client.call<RemoteListenerState>("remote.listener", { enabled });
+      if (!enabled) {
+        await this.client.call("daemon.lan.disable", {});
+        return this.disabledRemote();
+      }
+      const state = await this.client.call<WireLanState>("daemon.lan.enable", {});
+      const pairing = await this.client
+        .call<WireLanPairing>("daemon.lan.pair", {})
+        .catch(() => undefined);
+      return lanStateToRemote(state, pairing);
     } catch {
       return this.disabledRemote();
     }
   }
 
   async rotateRemoteToken(): Promise<RemoteListenerState> {
+    // No `remote.rotate` verb exists; pairing is daemon.lan.pair { name? }, which mints a
+    // fresh phone token + QR. Re-read the listener status for the current device list.
     try {
-      return await this.client.call<RemoteListenerState>("remote.rotate", {});
+      const pairing = await this.client.call<WireLanPairing>("daemon.lan.pair", {});
+      const state = await this.client.call<WireLanState>("daemon.lan.status", {});
+      return lanStateToRemote(state, pairing);
     } catch {
       return this.disabledRemote();
     }
   }
 
   async revokeRemoteDevice(deviceId: string): Promise<RemoteListenerState> {
+    // daemon.lan.revoke { token_id } (not `remote.revoke`/`device_id`). The device id IS
+    // the pairing token_id (PhonePairing.id). Re-read the listener status afterward.
     try {
-      return await this.client.call<RemoteListenerState>("remote.revoke", { device_id: deviceId });
+      await this.client.call("daemon.lan.revoke", { token_id: deviceId });
+      const state = await this.client.call<WireLanState>("daemon.lan.status", {});
+      return lanStateToRemote(state);
     } catch {
       return this.disabledRemote();
     }
@@ -583,9 +663,11 @@ export class LiveDataSource implements DataSource {
     const prev = this.client.onEvent;
     this.client.onEvent = (env: Envelope) => {
       prev?.(env);
-      // INTERPRET: event.subscribe streams card_events; the event payload IS the
-      // card_event row. Unknown kinds pass through untouched.
-      const ev = env.payload as CardEvent | undefined;
+      // event.subscribe delivers Envelope::event("event.card_event", EventCardEvent
+      // { event }), so the card_event row is NESTED under `payload.event`, not the flat
+      // payload. Reading it flat left card_id/kind undefined and the handler never fired
+      // (live board/queue updates were silently dead). Unknown kinds pass through.
+      const ev = (env.payload as { event?: CardEvent } | undefined)?.event;
       if (ev && ev.card_id && ev.kind) handler(ev);
     };
     // Ask the daemon to start streaming from the live head.
@@ -599,6 +681,317 @@ export class LiveDataSource implements DataSource {
 function errorMessage(e: unknown): string {
   if (e && typeof e === "object" && "message" in e) return String((e as { message: unknown }).message);
   return String(e);
+}
+
+// ---------------------------------------------------------------------------
+// Wire shapes + mappers. These mirror the daemon's dflow-proto structs exactly and map
+// them into the desktop's view-models, so the UI components and fixtures keep their
+// existing contracts while the live source reads what the daemon actually sends.
+// ---------------------------------------------------------------------------
+
+// github.issues.preview row (dflow-proto GithubIssuePreview).
+interface WireGithubIssuePreview {
+  number: number;
+  title: string;
+  labels?: string[];
+  state?: string;
+  url?: string;
+  dedupe?: string;
+  existing_card_id?: string | null;
+}
+
+// github.issues.import outcome row (dflow-proto GithubImportResult).
+interface WireGithubImportRow {
+  number: number;
+  title: string;
+  card_id: string;
+  outcome: string; // created | refreshed | suppressed
+}
+
+// github.issue.get issue snapshot (dflow-proto GithubIssueInfo).
+interface WireGithubIssueInfo {
+  number: number;
+  repo?: string;
+  title: string;
+  body?: string;
+  labels?: string[];
+  assignees?: string[];
+  milestone?: string | null;
+  state?: string;
+  url?: string;
+}
+
+// gate.status run (dflow-proto GateRunInfo).
+interface WireGateRunInfo {
+  id: string;
+  card_id: string;
+  worktree_id?: string | null;
+  step: string; // checks | review | autofix | escalate | push | pr | ci | done
+  status: string; // running | passed | failed | escalated
+  gate_strictness?: string | null;
+  author_harness?: string | null;
+  reviewer_harness?: string | null;
+  head_sha?: string | null;
+  branch?: string | null;
+  pr_number?: number | null;
+  pr_url?: string | null;
+  started_at?: number | null;
+  ended_at?: number | null;
+}
+
+// gate.status finding (dflow-proto FindingInfo).
+interface WireFindingInfo {
+  id: string;
+  gate_run_id: string;
+  card_id: string;
+  severity: string; // blocker | major | minor
+  category: string; // mechanical | intent
+  source: string;
+  body: string;
+  evidence?: string | null;
+  resolution?: string | null; // autofixed | accepted | fixed | skipped
+  created_at?: number | null;
+  resolved_at?: number | null;
+}
+
+// daemon.lan.* shapes (dflow-proto LanState / LanPairing / PhonePairing).
+interface WirePairingPayload {
+  url: string;
+  token: string;
+  name?: string | null;
+}
+interface WireLanPairing {
+  token_id: string;
+  pair_url: string;
+  payload: WirePairingPayload;
+}
+interface WirePhonePairing {
+  id: string;
+  name?: string | null;
+  created_at: number;
+  last_seen_at?: number | null;
+}
+interface WireLanState {
+  enabled: boolean;
+  bound: boolean;
+  port: number;
+  lan_urls?: string[];
+  caveat: string;
+  phones?: WirePhonePairing[];
+}
+
+// Build the daemon's GithubIssueFilter from the client-side import config. An empty config
+// yields an empty filter, which the daemon reads as "every open issue" (the curated picker).
+function filterFromConfig(config: GithubImportConfig | undefined): {
+  assignee?: string;
+  labels?: string[];
+  milestone?: string;
+  state?: string;
+} {
+  if (!config) return {};
+  const filter: { assignee?: string; labels?: string[]; milestone?: string; state?: string } = {};
+  if (config.assignees.length > 0) filter.assignee = config.assignees[0];
+  if (config.labels.length > 0) filter.labels = config.labels;
+  if (config.milestone) filter.milestone = config.milestone;
+  if (config.state) filter.state = config.state;
+  return filter;
+}
+
+// Label-heuristic card type (the daemon assigns the real one on import; this is only for
+// the preview badge). Falls back to feature.
+function suggestedTypeFromLabels(labels: string[]): CardType {
+  const set = labels.map((l) => l.toLowerCase());
+  if (set.some((l) => l.includes("bug") || l.includes("defect"))) return "bug";
+  if (set.some((l) => l.includes("chore") || l.includes("maintenance"))) return "chore";
+  if (set.some((l) => l.includes("test"))) return "test";
+  if (set.some((l) => l.includes("investigat") || l.includes("spike") || l.includes("question")))
+    return "investigation";
+  return "feature";
+}
+
+// Map a preview row into the view-model. The preview carries only number/title/labels/
+// state/url plus dedupe; the richer fields (body/author/comments) are not on the wire, so
+// they degrade to empty and the imported badge comes from existing_card_id.
+function githubIssueFromPreview(row: WireGithubIssuePreview, repo: string): GithubIssue {
+  const labels: GithubLabel[] = (row.labels ?? []).map((name) => ({ name }));
+  return {
+    number: row.number,
+    title: row.title,
+    body: "",
+    state: row.state === "closed" ? "closed" : "open",
+    author: "",
+    assignees: [],
+    labels,
+    milestone: null,
+    comments: [],
+    url: row.url ?? "",
+    repo,
+    updated_at: 0,
+    imported_card_id: row.existing_card_id ?? null,
+    suggested_type: suggestedTypeFromLabels(row.labels ?? []),
+  };
+}
+
+// Map github.issue.get's GithubIssueInfo into the view-model. The snapshot has no author
+// or comments and no timestamp, so those degrade (updated_at borrows the card's).
+function githubIssueFromInfo(info: WireGithubIssueInfo, card: Card): GithubIssue {
+  const labels: GithubLabel[] = (info.labels ?? []).map((name) => ({ name }));
+  return {
+    number: info.number,
+    title: info.title,
+    body: info.body ?? "",
+    state: info.state === "closed" ? "closed" : "open",
+    author: "",
+    assignees: info.assignees ?? [],
+    labels,
+    milestone: info.milestone ?? null,
+    comments: [],
+    url: info.url ?? "",
+    repo: info.repo ?? "",
+    updated_at: card.updated_at,
+    imported_card_id: card.id,
+    suggested_type: suggestedTypeFromLabels(info.labels ?? []),
+  };
+}
+
+// The UI's FindingResolution vocabulary (approve|fix|skip) vs the daemon's
+// (accepted|fixed|skipped, plus autofixed for mechanical auto-applies).
+function resolutionToDaemon(r: FindingResolution): string {
+  switch (r) {
+    case "approve":
+      return "accepted";
+    case "fix":
+      return "fixed";
+    case "skip":
+      return "skipped";
+    default:
+      return "accepted";
+  }
+}
+function resolutionFromDaemon(s: string | null | undefined): FindingResolution | null {
+  switch (s) {
+    case "accepted":
+      return "approve";
+    case "fixed":
+    case "autofixed":
+      return "fix";
+    case "skipped":
+      return "skip";
+    default:
+      return null;
+  }
+}
+
+// Map GateRunInfo.step/status onto the UI's flat GateStatus. The UI also computes
+// awaiting-human from open intent findings, so the exact running-step mapping is advisory.
+function gateStatusFromWire(run: WireGateRunInfo): GateStatus {
+  if (run.status === "passed") return "passed";
+  if (run.status === "failed") return "failed";
+  if (run.status === "escalated") return "awaiting_human";
+  switch (run.step) {
+    case "checks":
+      return "checks_running";
+    case "review":
+      return "review";
+    case "autofix":
+      return "autofixing";
+    case "escalate":
+      return "awaiting_human";
+    case "push":
+    case "pr":
+    case "ci":
+    case "done":
+      return "passed";
+    default:
+      return "pending";
+  }
+}
+
+function gateFindingFromWire(f: WireFindingInfo): GateFinding {
+  return {
+    id: f.id,
+    severity: (f.severity as GateFinding["severity"]) ?? "minor",
+    title: f.body,
+    scenario: f.evidence ?? "",
+    rule: null,
+    file: null,
+    line: null,
+    klass: f.category === "mechanical" ? "mechanical" : "intent",
+    resolution: resolutionFromDaemon(f.resolution),
+    auto_applied: f.resolution === "autofixed",
+  };
+}
+
+// Map GateRunInfo + findings into the view-model. GateRunInfo has no per-check rows (checks
+// stream as card events) and no rich PR sub-state, so `checks` is empty and `pr` carries
+// only what the run row exposes (number/url/branch); `mergeable` stays false (honest: the
+// UI's disabled-until-green rule needs real CI, which the run row does not carry).
+function gateRunFromWire(run: WireGateRunInfo, findings: WireFindingInfo[]): GateRun {
+  const mode: GateMode =
+    run.gate_strictness === "checks_only" ? "checks_only" : run.gate_strictness === "none" ? "none" : "full";
+  return {
+    id: run.id,
+    card_id: run.card_id,
+    status: gateStatusFromWire(run),
+    mode,
+    worktree_id: run.worktree_id ?? "",
+    reviewer_harness: run.reviewer_harness ?? null,
+    started_at: run.started_at ?? 0,
+    updated_at: run.ended_at ?? run.started_at ?? 0,
+    checks: [],
+    findings: findings.map(gateFindingFromWire),
+    findings_doc_id: null,
+    pr: {
+      status: run.pr_number != null ? "open" : "none",
+      number: run.pr_number ?? null,
+      url: run.pr_url ?? null,
+      branch: run.branch ?? "",
+      ci: [],
+      mergeable: false,
+      merge_method: "squash",
+      fixes_issue: null,
+    },
+  };
+}
+
+// The fixed phone capability profile (security.md): Needs You, approvals, steering, and
+// read-only terminals; no vault, no recipe install.
+function phoneProfile(): RemoteCapabilityProfile {
+  return {
+    needs_you: true,
+    approvals: true,
+    steering: true,
+    terminals_read_only: true,
+    vault_access: false,
+    recipe_install: false,
+  };
+}
+
+function phoneToDevice(p: WirePhonePairing): PairedDevice {
+  return {
+    id: p.id, // the pairing token_id, which is also the daemon.lan.revoke target
+    name: p.name ?? "Phone",
+    profile: "phone",
+    paired_at: p.created_at,
+    last_seen: p.last_seen_at ?? null,
+    capabilities: phoneProfile(),
+  };
+}
+
+// Map LanState (+ an optional fresh pairing) into the desktop's RemoteListenerState. A
+// pairing is present only right after enable/pair, which is exactly when the QR is shown.
+function lanStateToRemote(s: WireLanState, pairing?: WireLanPairing): RemoteListenerState {
+  return {
+    enabled: !!s.enabled,
+    lan_ip: null,
+    port: s.port || null,
+    url: (s.lan_urls ?? [])[0] ?? null,
+    pairing_payload: pairing?.pair_url ?? null,
+    token: pairing?.payload?.token ?? null,
+    minted_at: pairing ? Date.now() : null,
+    profile: phoneProfile(),
+    devices: (s.phones ?? []).map(phoneToDevice),
+  };
 }
 
 // Best-effort human capability kind from a daemon elevation one-liner. The verbatim
