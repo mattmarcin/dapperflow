@@ -173,7 +173,9 @@ function RecipeRow({
   needsConsent: boolean;
   onPick: () => void;
 }) {
-  const trust = TRUST_META[recipe.trust];
+  // Defensive: an unexpected/missing trust tier (e.g. a raw daemon row that slipped
+  // normalization) must never throw and blank the app - fall back to the standard tier.
+  const trust = TRUST_META[recipe.trust] ?? TRUST_META.standard;
   return (
     <button
       type="button"
@@ -192,7 +194,7 @@ function RecipeRow({
       </span>
       <span className="rd-row-desc">{recipe.description}</span>
       <span className="rd-stages">
-        {recipe.stageLines.map((s) => (
+        {(recipe.stageLines ?? []).map((s) => (
           <span key={`${recipe.name}-${s.stage}`} className="rd-stage">
             <span className="rd-stage-name">{s.stage}</span>
             <span className="rd-stage-note">{s.note}</span>
@@ -243,7 +245,7 @@ export function ConsentSummary({
         recipe file changes.
       </p>
       <ul className="rd-priv-list">
-        {recipe.privileges.map((p, i) => (
+        {(recipe.privileges ?? []).map((p, i) => (
           <PrivilegeLine key={i} privilege={p} />
         ))}
       </ul>
@@ -268,7 +270,7 @@ export function ConsentSummary({
 function PrivilegeLine({ privilege }: { privilege: RecipePrivilege }) {
   return (
     <li className="rd-priv">
-      <span className="rd-priv-kind">{PRIVILEGE_LABEL[privilege.kind]}</span>
+      <span className="rd-priv-kind">{PRIVILEGE_LABEL[privilege.kind] ?? "Elevated capability"}</span>
       <code className="rd-priv-detail">{privilege.detail}</code>
     </li>
   );
