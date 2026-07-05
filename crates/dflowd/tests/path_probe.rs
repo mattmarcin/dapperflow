@@ -37,5 +37,12 @@ async fn dispatch_prepends_dflow_dir_to_path() {
     if let Some(i) = low.find("ppath=") {
         println!("PATH (first 300 chars): {}", &low[i..(i + 300).min(low.len())]);
     }
-    assert!(low.contains(&dflow_dir), "dflow binary dir not on the session PATH");
+    // The echoed %Path% wraps across terminal rows, and a wrap boundary can split the
+    // path with inserted whitespace, so compare with all whitespace removed (the paths
+    // being matched contain no legitimate whitespace of their own).
+    let squash = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    assert!(
+        squash(&low).contains(&squash(&dflow_dir)),
+        "dflow binary dir not on the session PATH"
+    );
 }

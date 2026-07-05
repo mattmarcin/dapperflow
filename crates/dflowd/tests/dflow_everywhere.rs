@@ -25,10 +25,12 @@ use dflow_proto::{AuthHello, ClientKind, Envelope, PROTOCOL_VERSION};
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-/// A bare-terminal command that echoes the injected dflow env into the PTY so the test can
-/// read the real per-task token back and assert on the endpoint, empty card, and PATH.
-/// `DCARD=[...]` brackets the card so an empty value is visible as `DCARD=[]`.
-const ECHO_ENV: &str = r#"["cmd.exe","/d","/k","echo DTOKEN=%DFLOW_TOKEN%; DEND=%DFLOW_ENDPOINT%; DCARD=[%DFLOW_CARD%]; DPATH=%PATH%"]"#;
+/// A bare-terminal command that echoes the injected dflow env into the PTY (so the test
+/// can read the real per-task token back and assert on the endpoint and empty card), then
+/// runs `dflow` by BARE NAME - which resolves only if the dflow dir is on the session PATH,
+/// and prints the cardless surface, proving availability without parsing the wrapped
+/// `%PATH%` echo. `DCARD=[...]` brackets the card so an empty value is visible as `DCARD=[]`.
+const ECHO_ENV: &str = r#"["cmd.exe","/d","/k","echo DTOKEN=%DFLOW_TOKEN%; DEND=%DFLOW_ENDPOINT%; DCARD=[%DFLOW_CARD%] & dflow"]"#;
 
 /// Open an `agent`-client WS connection authenticated with a per-task token.
 async fn connect_agent(port: u16, token: &str) -> Ws {
@@ -107,8 +109,6 @@ async fn new_session_injects_project_scoped_dflow_env() {
     let data_dir = unique_data_dir("everywhere-env");
     let repo = scratch_repo(&data_dir);
     let repo_str = repo.to_string_lossy().to_string();
-    // The dflow dir the daemon prepends to PATH is the daemon binary's own directory.
-    let dflow_dir = Path::new(env!("CARGO_BIN_EXE_dflowd")).parent().unwrap().to_path_buf();
 
     let (_daemon, port, token) = start_daemon(&data_dir, &[]);
     let mut root = connect_and_auth(port, &token).await;
@@ -124,7 +124,12 @@ async fn new_session_injects_project_scoped_dflow_env() {
     let project_id = padd.payload["project_id"].as_str().unwrap().to_string();
 
     // ---- 1. Availability: DFLOW_TOKEN + DFLOW_ENDPOINT + dflow on PATH, empty card. ----
-    let (session_id, screen) = start_cardless_session(&mut root, &mut sink, &repo_str).await;
+    let (session_id, mut screen) = start_cardless_session(&mut root, &mut sink, &repo_str).await;
+    // The `& dflow` tail runs dflow by bare name once the token/endpoint/PATH are injected;
+    // wait for its output to land in scrollback if it has not already.
+    if !screen.contains("no card assigned") {
+        screen.push_str(&collect_output_until(&mut root, "no card assigned", Duration::from_secs(15)).await);
+    }
     let task_token = token_after(&screen, "DTOKEN=");
     assert!(screen.contains("DEND=ws://127.0.0.1"), "endpoint not injected: {screen}");
     // A cardless session's DFLOW_CARD is empty; Windows drops an empty-valued env var, so
@@ -135,10 +140,12 @@ async fn new_session_injects_project_scoped_dflow_env() {
         screen.contains("DCARD=[]") || screen.contains("DCARD=[%DFLOW_CARD%]"),
         "cardless session must ship no DFLOW_CARD: {screen}"
     );
+    // dflow is on the session PATH: running it by BARE NAME (the `& dflow` tail) resolves
+    // and prints the cardless surface - a short, wrap-immune string - proving PATH
+    // availability end-to-end without parsing the wrapped %PATH% echo.
     assert!(
-        screen.contains(&dflow_dir.to_string_lossy().to_string()),
-        "dflow dir not prepended to the session PATH: want {}, screen: {screen}",
-        dflow_dir.display()
+        screen.contains("no card assigned"),
+        "dflow must resolve by bare name on the New Session PATH and report the cardless surface: {screen}"
     );
 
     // ---- 2. Token scope: project-scoped agent token. ----
