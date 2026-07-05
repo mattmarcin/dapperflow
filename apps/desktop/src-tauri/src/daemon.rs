@@ -100,6 +100,31 @@ pub fn ensure_running() -> Result<DaemonInfo, String> {
     }
 }
 
+/// Gracefully stop the running daemon by invoking `<daemon> --stop` (reaps the whole tree
+/// via the Job Object, marks sessions interrupted/resumable). Used by the tray Stop and by
+/// a keep-alive-off quit. Best-effort binary resolution: the managed copy, else the bundled
+/// source. This is NEVER a force-kill - the app only ever asks the daemon to stop itself.
+pub fn graceful_stop() -> Result<(), String> {
+    let bin = managed_daemon_path()
+        .ok()
+        .filter(|p| p.exists())
+        .or_else(|| bundled_daemon_source().ok())
+        .ok_or_else(|| "could not locate a dflowd binary to stop".to_string())?;
+    let status = std::process::Command::new(&bin)
+        .arg("--stop")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| format!("running {} --stop: {e}", bin.display()))?;
+    // `--stop` exits 0 (stopped) or 3 (nothing was running); both mean "no daemon left".
+    match status.code() {
+        Some(0) | Some(3) => Ok(()),
+        Some(c) => Err(format!("dflowd --stop exited with code {c}")),
+        None => Err("dflowd --stop was terminated by a signal".to_string()),
+    }
+}
+
 /// Which ownership mode applies. `DFLOW_DEV_EXTERNAL_DAEMON` is the explicit override
 /// (`1`/`true` -> dev-external, `0`/`false` -> prod-managed); unset defaults to
 /// dev-external for a debug build and prod-managed for a release build.
