@@ -1,0 +1,48 @@
+# DapperFlow cargo workspace.
+# Crate responsibilities are defined in docs/spec/architecture.md (Crate layout).
+[workspace]
+resolver = "2"
+members = [
+    "crates/dflow-core",
+    "crates/dflow-proto",
+    "crates/dflowd",
+    "crates/dflow-cli",
+    "crates/dflow-mcp",
+    "crates/dflow-stubtui",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["DapperFlow"]
+repository = "https://github.com/mattmarcin/dapperflow"
+
+# Shared dependency versions. Individual crates opt in by name under their own
+# [dependencies] with `workspace = true`, so versions stay consistent across the tree.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws"] }
+futures-util = "0.3"
+ulid = "1"
+base64 = "0.22"
+rand = "0.9"
+portable-pty = "0.9"
+alacritty_terminal = "0.26"
+fs2 = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
+toml = "0.8"
+
+# Internal crates.
+dflow-proto = { path = "crates/dflow-proto" }
+dflow-core = { path = "crates/dflow-core" }
+
+[profile.release]
+lto = "thin"

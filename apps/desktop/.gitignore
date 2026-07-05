@@ -1,0 +1,14 @@
+# Node
+node_modules/
+dist/
+
+# Tauri build output and generated schema/context
+src-tauri/target/
+src-tauri/gen/
+
+# Generated mobile icon sets (Windows-first Phase 0; regenerate with tauri icon)
+src-tauri/icons/android/
+src-tauri/icons/ios/
+
+# Browser-dev daemon handoff (never commit a token)
+public/daemon-dev.json

@@ -1,0 +1,39 @@
+# Pi Coding Agent adapter manifest (docs/spec/adapters.md).
+#
+# Not installed on this machine: every value is [D] verified-docs or [S] seed, none
+# [L] verified-local (the design notes). No native push tier-2 signal for
+# an interactive session; supervision leans on tier-1 (dflow status) and tier-3.
+# MCP is intentionally excluded by design, so an MCP-mounting recipe must fail
+# recipe x harness validation on pi (dispatch flow, adapters.md).
+
+[adapter]
+name = "pi"
+command = "pi"
+launch = ["{command}", "{autonomy_flags}", "{model_flag}", "{effort_flag}", "{prompt}"]
+autonomy_flags = []                        # -a/--approve, -na/--no-approve; no per-tool popups [D]
+model_flag = ["--model", "{model}"]        # [D] provider/id, also sonnet:high shorthand
+effort_flag = ["--thinking", "{effort}"]   # [D] off|minimal|low|medium|high|xhigh
+env = {}
+no_auto_steer = false
+
+[signals]
+busy_signature = "esc to interrupt"   # [S] busy footer text, not installed to probe
+native = "none"                        # [D] no hooks, no notify; --mode json headless only
+
+[controls]
+interrupt = "escape"    # [D] Esc restores queued messages to the editor
+exit_command = "/quit"  # [D]
+resume = ["{command}", "--resume", "{resume_ref}"]   # [D] -r picker / -c most recent
+skill_invocation = "/skill:{skill}"                   # [D]
+
+[dialogs]
+trust = { pattern = "trust", response = "enter" }   # [D] per-folder trust to ~/.pi/agent/trust.json
+
+[composer]
+popup_prefixes = ["/"]
+popup_settle_ms = 1200
+ghost_text_styles = ["dim"]
+
+[capabilities]
+mcp = false         # [D] pi intentionally ships no MCP; MCP recipes must fail validation
+native_tier2 = "none (event stream in --mode json only)"

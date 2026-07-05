@@ -1,0 +1,39 @@
+# OpenCode adapter manifest (docs/spec/adapters.md).
+#
+# Server-first: the cleanest tier-2 is the server SSE bus `GET /event` -> session.idle
+# (no screen scraping). Whether the current session model launches an addressable
+# server, or needs `opencode serve` + attach, is a Phase 2 integration question
+# (the design notes). Tags: [L] local, [D] docs, [S] seed.
+
+[adapter]
+name = "opencode"
+command = "opencode"
+# The brief is the value of --prompt, so --prompt stays immediately before {prompt}.
+launch = ["{command}", "{autonomy_flags}", "{model_flag}", "{effort_flag}", "--prompt", "{prompt}"]
+autonomy_flags = []                       # --auto auto-approves (dangerous) [L], not defaulted
+model_flag = ["-m", "{model}"]            # [L] provider/model
+effort_flag = ["--variant", "{effort}"]   # [L] provider-specific reasoning variant
+env = {}
+no_auto_steer = false
+
+[signals]
+busy_signature = "esc to interrupt"   # [S] interrupt hint, probed live in Phase 2
+native = "sse"                         # [D] server SSE GET /event -> session.idle
+
+[controls]
+interrupt = "escape"    # [S] double-Esc flakiness is a seed hazard
+exit_command = "/exit"  # [S]
+resume = ["{command}", "-s", "{resume_ref}"]   # [L] -s <session>, -c most recent
+skill_invocation = "/{skill}"                   # [S] exact form still to confirm live
+
+[dialogs]
+trust = { pattern = "trust", response = "enter" }   # [S] permission model, weak trust gate
+
+[composer]
+popup_prefixes = ["/"]
+popup_settle_ms = 1200
+ghost_text_styles = ["dim"]
+
+[capabilities]
+mcp = true          # [L] opencode mcp add
+native_tier2 = "server SSE session.idle"

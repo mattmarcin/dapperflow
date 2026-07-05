@@ -1,0 +1,39 @@
+# Codex CLI adapter manifest (docs/spec/adapters.md).
+#
+# Native tier-2 is the `notify` program on agent-turn-complete (interactive, a
+# turn-boundary ping only) or the `codex exec --json` JSONL stream (headless). notify
+# must live in user-level ~/.codex/config.toml; whether a per-launch `-c` override can
+# scope it without touching user-global config is a Phase 2 live probe
+# (the design notes). Tags: [L] local, [D] docs, [S] seed.
+
+[adapter]
+name = "codex"
+command = "codex"
+launch = ["{command}", "{autonomy_flags}", "{model_flag}", "{effort_flag}", "{prompt}"]
+autonomy_flags = []                                   # -a/--ask-for-approval, -s/--sandbox available [L], not defaulted
+model_flag = ["-m", "{model}"]                        # [L]
+effort_flag = ["-c", "model_reasoning_effort={effort}"]  # [D] no dedicated flag; config override
+env = {}
+no_auto_steer = false
+
+[signals]
+busy_signature = "esc to interrupt"   # [S] interrupt hint in TUI footer, probed live in Phase 2
+native = "notify"                      # [D] notify on agent-turn-complete; exec --json headless
+
+[controls]
+interrupt = "escape"    # [S]
+exit_command = "/quit"  # [S] Ctrl+C also
+resume = ["{command}", "resume", "{resume_ref}"]   # [L] codex resume <thread-id>
+skill_invocation = "${skill}"                       # [D] $ for skills, / for built-ins
+
+[dialogs]
+trust = { pattern = "trust", response = "enter" }   # [S] folder-trust + approval-mode prompt
+
+[composer]
+popup_prefixes = ["/", "$"]   # / built-ins and $ skills both open completion popups
+popup_settle_ms = 1200
+ghost_text_styles = ["dim"]
+
+[capabilities]
+mcp = true          # [L] codex mcp add / [mcp_servers]
+native_tier2 = "notify + exec --json"

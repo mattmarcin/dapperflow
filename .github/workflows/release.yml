@@ -1,0 +1,158 @@
+name: Release
+
+# Fires on a semver-ish tag push (v1.2.3, v0.1.0-rc1, ...). Builds the Tauri
+# desktop installers for Windows/macOS/Linux and the mobile PWA bundle, then
+# publishes a DRAFT GitHub Release with everything attached. Draft = a human
+# reviews and clicks publish. Design: docs/spec/cicd.md, "Release pipeline".
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Never cancel a release mid-build; let each tag's run finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # create the release and upload assets
+  id-token: write # OIDC token for Sigstore build-provenance signing
+  attestations: write # upload the provenance attestation
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # Desktop installers via tauri-action, one leg per OS. macOS builds a #
+  # universal (arm64 + x86_64) binary.                                  #
+  # ------------------------------------------------------------------ #
+  desktop:
+    name: desktop installers (${{ matrix.platform }})
+    # Guard: only the canonical repo publishes releases (forks skip cleanly).
+    if: github.repository == 'mattmarcin/dapperflow'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            args: ""
+            rust-targets: ""
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+          - platform: macos-latest
+            args: "--target universal-apple-darwin"
+            rust-targets: "aarch64-apple-darwin,x86_64-apple-darwin"
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Tauri system deps (Linux)
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libsoup-3.0-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            file \
+            wget \
+            curl
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - name: Cache cargo build (src-tauri)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: ${{ matrix.platform }}
+
+      # tauri-action runs the tauri.conf.json beforeBuildCommand (`pnpm build`),
+      # so the frontend deps must already be installed.
+      - name: Install desktop frontend deps
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build app + create draft release
+        id: tauri
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # ---- Code-signing / notarization secrets (TODO, see cicd.md) ----
+          # Desktop updater signing (only if an updater is added to tauri.conf.json):
+          #   TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # macOS notarization:
+          #   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_SIGNING_IDENTITY
+          #   APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID
+          # Windows Authenticode is configured via tauri.conf.json + a cert secret.
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: "DapperFlow ${{ github.ref_name }}"
+          releaseBody: "Download the installer for your platform from the assets below."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+
+      # Supply-chain provenance for every produced installer. The two globs cover
+      # the native path (target/release/bundle) and the cross/universal path
+      # (target/<triple>/release/bundle). At least one matches on each runner.
+      - name: Attest installer provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            apps/desktop/src-tauri/target/release/bundle/**/*
+            apps/desktop/src-tauri/target/*/release/bundle/**/*
+
+  # ------------------------------------------------------------------ #
+  # Mobile PWA: build the dist bundle, attest it, publish as a workflow #
+  # artifact (downloadable from the run).                               #
+  # ------------------------------------------------------------------ #
+  mobile-pwa:
+    name: mobile PWA bundle
+    if: github.repository == 'mattmarcin/dapperflow'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - name: Install Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - name: Build PWA
+        working-directory: apps/mobile
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+      - name: Package dist tarball
+        working-directory: apps/mobile
+        run: tar -czf "dapperflow-mobile-pwa-${{ github.ref_name }}.tar.gz" -C dist .
+      - name: Attest PWA provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: apps/mobile/dapperflow-mobile-pwa-${{ github.ref_name }}.tar.gz
+      - name: Upload PWA bundle (workflow artifact)
+        uses: actions/upload-artifact@v7
+        with:
+          name: dapperflow-mobile-pwa-${{ github.ref_name }}
+          path: apps/mobile/dist
+          if-no-files-found: error

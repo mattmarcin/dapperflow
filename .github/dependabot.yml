@@ -1,0 +1,76 @@
+# Dependabot configuration for DapperFlow.
+# Design and rationale: docs/spec/cicd.md ("Dependency updates").
+#
+# Ecosystems:
+#   - cargo          x2 : the root cargo workspace (6 crates) and the separate
+#                         Tauri desktop workspace (apps/desktop/src-tauri), which
+#                         has its own Cargo.toml/Cargo.lock.
+#   - npm (pnpm)     x2 : Dependabot's `npm` ecosystem understands pnpm-lock.yaml;
+#                         one entry per pnpm project (desktop, mobile).
+#   - github-actions x1 : keeps the pinned action majors in .github/workflows fresh.
+version: 2
+updates:
+  # ---- Rust: root workspace ----
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  # ---- Rust: Tauri desktop app (standalone workspace + lockfile) ----
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      tauri-minor-patch:
+        update-types: [minor, patch]
+
+  # ---- Frontend: desktop (pnpm) ----
+  - package-ecosystem: npm
+    directory: /apps/desktop
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      desktop-minor-patch:
+        update-types: [minor, patch]
+
+  # ---- Frontend: mobile PWA (pnpm) ----
+  - package-ecosystem: npm
+    directory: /apps/mobile
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      mobile-minor-patch:
+        update-types: [minor, patch]
+
+  # ---- GitHub Actions used by the workflows ----
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions-all:
+        patterns: ["*"]

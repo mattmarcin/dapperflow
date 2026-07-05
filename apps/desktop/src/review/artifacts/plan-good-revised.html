@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Plan - Resilient webhook ingestion</title>
+<style>
+  /* Self-contained: inline styles only (CSP style-src 'unsafe-inline'); no CDNs,
+     no root-absolute asset paths; renders identically outside the app. */
+  :root {
+    --bg: #0f1217; --panel: #161b23; --line: #232b36; --ink: #e9e7e2;
+    --dim: #99a1ae; --faint: #6b7482; --brass: #e6a23c; --violet: #c98bdb;
+    --live: #7bd0a8; --danger: #e5686a;
+    --mono: "Cascadia Mono", ui-monospace, Consolas, monospace;
+    --ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--ui); font-size: 14px; line-height: 1.6;
+  }
+  .doc { max-width: 820px; margin: 0 auto; padding: 32px 28px 80px; }
+  header.plan-head { border-bottom: 1px solid var(--line); padding-bottom: 18px; margin-bottom: 22px; }
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--brass); }
+  h1 { font-size: 24px; margin: 8px 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--dim); margin: 0; }
+  h2 { font-size: 16px; margin: 30px 0 10px; padding-left: 10px; border-left: 3px solid var(--brass); }
+  p { margin: 0 0 12px; }
+  section { margin-bottom: 8px; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  .panel h3 { margin: 0 0 8px; font-size: 13px; color: var(--dim); font-family: var(--mono); letter-spacing: 0.04em; }
+  code { font-family: var(--mono); background: #1d2530; padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+  ul { margin: 6px 0 12px; padding-left: 18px; }
+  li { margin: 4px 0; }
+  .q { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin: 14px 0; }
+  .q > .label { font-weight: 600; margin-bottom: 10px; display: block; }
+  .opts label { display: flex; align-items: center; gap: 8px; padding: 5px 0; cursor: pointer; }
+  input[type="text"], textarea {
+    width: 100%; background: #0e1218; border: 1px solid var(--line); color: var(--ink);
+    border-radius: 6px; padding: 8px 10px; font-family: var(--ui); font-size: 13px;
+  }
+  textarea { resize: vertical; min-height: 62px; }
+  .editable {
+    background: #0e1218; border: 1px dashed var(--line); border-radius: 6px; padding: 8px 10px;
+    min-height: 40px; outline: none;
+  }
+  .editable:focus { border-color: var(--violet); border-style: solid; }
+  .action-btn {
+    font-family: var(--mono); font-size: 12px; background: transparent; color: var(--violet);
+    border: 1px solid rgba(201,139,219,0.5); border-radius: 6px; padding: 8px 12px; cursor: pointer;
+  }
+  .action-btn:hover { background: rgba(201,139,219,0.12); }
+  .mermaid { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 10px 0; }
+  .hint { color: var(--faint); font-size: 12px; font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="doc">
+  <header class="plan-head">
+    <div class="eyebrow">Plan round 4 - revised after feedback</div>
+    <h1>Resilient webhook ingestion</h1>
+    <p class="sub">Accept third-party webhooks without losing events when downstream is slow or flaky.</p>
+  </header>
+
+  <section>
+    <h2>Overview</h2>
+    <p>
+      We terminate inbound webhooks at a thin gateway that does nothing but authenticate the
+      caller and durably enqueue the raw payload. A pool of workers drains the queue and applies
+      business logic. The gateway stays fast and boring; all the retry complexity lives in the worker.
+    </p>
+  </section>
+
+  <section id="retry-plan">
+    <h2>Retry strategy</h2>
+    <p>
+      Transient failures are the common case here, not the exception.
+      Delivery to the downstream store can fail transiently, so the worker does not fail the whole
+      event on the first error. Instead it will <strong>retry with exponential backoff</strong>,
+      starting at 200ms and doubling until a cap.
+    </p>
+    <p>
+      When a payload cannot be delivered after repeated attempts it moves to a dead-letter queue for
+      later inspection, rather than blocking the head of the line.
+    </p>
+  </section>
+
+  <section>
+    <h2>Architecture</h2>
+    <div class="mermaid" id="arch" data-diagram="arch">
+graph TD
+  ingress[Webhook ingress] --> gateway[API gateway]
+  gateway --> queue[(Durable queue)]
+  queue --> worker[Retry worker]
+  worker -->|delivered| store[(Event store)]
+  worker -->|exhausted| dlq[Dead letter]
+    </div>
+    <p class="hint">In annotate mode, click a node to attach a comment to it.</p>
+  </section>
+
+  <section>
+    <h2>Failure handling</h2>
+    <p>
+      The worker keeps draining so one poison message never stalls the pipeline; a dead letter is
+      inspected out of band and replayed once the downstream recovers.
+    </p>
+  </section>
+
+  <section>
+    <h2>Open questions</h2>
+
+    <div class="q">
+      <span class="label">Which storage engine for the event store?</span>
+      <div class="opts">
+        <label><input type="radio" name="storage" value="sqlite" data-question-key="storage" checked /> SQLite (single node, simplest)</label>
+        <label><input type="radio" name="storage" value="postgres" data-question-key="storage" /> Postgres (room to grow)</label>
+        <label><input type="radio" name="storage" value="none" data-question-key="storage" /> No durable store yet (v1 forwards only)</label>
+      </div>
+    </div>
+
+    <div class="cols">
+      <div class="q">
+        <span class="label">Delivery guarantees</span>
+        <div class="opts">
+          <label><input type="checkbox" data-question-key="guarantee.idempotency" /> Idempotency keys</label>
+          <label><input type="checkbox" data-question-key="guarantee.ordering" /> Preserve per-source ordering</label>
+          <label><input type="checkbox" data-question-key="dead_letter_alerting" /> Alert on dead-letter growth</label>
+        </div>
+      </div>
+      <div class="q">
+        <span class="label">Queue name</span>
+        <input type="text" data-question-key="queue_name" placeholder="e.g. webhooks.inbound" aria-label="Queue name" />
+        <span class="label" style="margin-top:12px">Hard constraints</span>
+        <textarea data-question-key="constraints" placeholder="Anything the design must not violate"></textarea>
+      </div>
+    </div>
+
+    <div class="q">
+      <span class="label">Acceptance criteria (edit inline)</span>
+      <div class="editable" contenteditable="true" data-question-key="acceptance">No event is acknowledged to the caller until it is durably enqueued.</div>
+    </div>
+
+    <button class="action-btn" data-action="propose-alternative" data-section="retry">Propose an alternative retry design</button>
+  </section>
+</div>
+</body>
+</html>

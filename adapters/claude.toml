@@ -1,0 +1,49 @@
+# Claude Code adapter manifest (docs/spec/adapters.md).
+#
+# The richest native signal surface of the four launch-set harnesses: Stop /
+# Notification / SessionEnd hooks distinguish agent_completed from agent_needs_input
+# from idle_prompt without screen scraping (spike2-harness-signal-audit.md).
+#
+# Verification tags carried inline: [L] verified-local, [D] verified-docs, [S] seed
+# (needs a live probe). Values marked [S] are re-verified by the Phase 2 probe suite
+# (the design notes) before they are trusted for auto-steering.
+
+[adapter]
+name = "claude"
+command = "claude"
+# Launch template. Tokens expand at dispatch: {command} -> the launcher command,
+# {autonomy_flags}/{model_flag}/{effort_flag} splice their arrays (empty when the
+# axis is unset), {prompt} -> the composed brief (omitted for a bare interactive
+# session). A launcher's extra_args are appended after this template.
+launch = ["{command}", "{autonomy_flags}", "{model_flag}", "{effort_flag}", "{prompt}"]
+autonomy_flags = ["--permission-mode", "acceptEdits"]   # [L]
+model_flag = ["--model", "{model}"]                      # [L] alias or full name
+effort_flag = ["--effort", "{effort}"]                   # [L] low|medium|high|xhigh|max
+env = {}
+no_auto_steer = false
+
+[signals]
+busy_signature = "esc to interrupt"   # [S] tier-3 footer text, probed live in Phase 2
+native = "hooks"                       # [D] Stop/Notification/SessionEnd, HTTP transport
+
+[controls]
+interrupt = "escape"        # [S]
+exit_command = "/exit"      # [S]
+resume = ["{command}", "--resume", "{resume_ref}"]   # [D] resume assigns a new id
+skill_invocation = "/{skill}"                        # [L] slash form
+
+[dialogs]
+# pattern -> response, matched against the daemon screen model for trust/permission.
+# [L] VERIFIED-LOCAL 2026-07-04: the real first-run dialog reads "Is this a project you
+# created or one you trust?" with "> 1. Yes, I trust this folder" / "2. No, exit" and
+# "Enter to confirm". Enter confirms the highlighted "Yes, I trust this folder".
+trust = { pattern = "trust this folder", response = "enter" }  # [L]
+
+[composer]
+popup_prefixes = ["/"]        # slash opens a command popup that can swallow Enter
+popup_settle_ms = 1200
+ghost_text_styles = ["dim"]   # argument-hint placeholder / suggestion is dim
+
+[capabilities]
+mcp = true          # [L] --mcp-config, claude mcp add, claude mcp serve
+native_tier2 = "Stop/Notification/SessionEnd hooks (HTTP or stream-json)"

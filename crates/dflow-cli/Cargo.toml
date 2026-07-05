@@ -1,0 +1,19 @@
+[package]
+name = "dflow-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The agent-side `dflow` CLI (agent-cli.md): a tiny cross-platform binary placed on PATH in every leased worktree."
+
+[[bin]]
+name = "dflow"
+path = "src/main.rs"
+
+[dependencies]
+dflow-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Blocking WebSocket client: the CLI is one request/response per invocation, so a
+# synchronous client is simpler and lighter than pulling in an async runtime.
+tungstenite = "0.29"

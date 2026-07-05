@@ -1,0 +1,12 @@
+[package]
+name = "dflow-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Versioned wire protocol types shared by dflowd, the desktop app, the dflow CLI, and future clients."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

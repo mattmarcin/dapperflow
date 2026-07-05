@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- Mobile-first: cover the notch, lock the scale, own the status bar. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no"
+    />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0e1116" />
+    <meta name="description" content="DapperFlow - the phone attention surface for your fleet of coding agents." />
+
+    <!-- Installable identity (see public/manifest.webmanifest). Honest note: on a
+         plain-HTTP LAN origin the browser grants only a capability-less shortcut,
+         never a true install, and no service worker - the app runs fully regardless. -->
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+
+    <!-- iOS home-screen web-app hints (used only where the origin permits install). -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="DapperFlow" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <title>DapperFlow</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,30 @@
+# Reference clones of prior-art repos (ideas only, never a runtime dependency)
+vendor/
+
+# Rust
+target/
+
+# Node / frontend
+node_modules/
+dist/
+
+# Local state and secrets
+*.local
+.env
+.env.*
+
+# OS noise
+Thumbs.db
+.DS_Store
+
+# Obsidian vault state (user-local; per knowledge.md)
+.obsidian/
+**/.obsidian/
+
+# Internal development artifacts - kept local, not part of the public product surface
+HANDOFF.md
+docs/spikes/
+docs/qa/
+docs/debt/
+docs/reviews/
+docs/research/

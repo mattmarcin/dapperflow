@@ -1,0 +1,21 @@
+# A stub TUI that emulates an agent composer with the verified-submit hazards
+# (popup swallow, placeholder expansion, ghost text, slow redraw, never-submit).
+# Test-only: the verified-submit matrix (adapters.md / Verified submit) drives it
+# through a real PTY. Not shipped in the product.
+[package]
+name = "dflow-stubtui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Stub agent TUI for the DapperFlow verified-submit test matrix."
+publish = false
+
+[[bin]]
+name = "dflow-stubtui"
+path = "src/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
+dflow-core = { workspace = true }

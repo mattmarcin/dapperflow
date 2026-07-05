@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the main DapperFlow window. The daemon_info command is app-defined and needs no extra ACL. dialog:allow-open enables the native folder picker used by the add-project flow. notification:default enables desktop notifications for Needs You arrivals (permission is requested at runtime).",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:allow-open", "notification:default"]
+}

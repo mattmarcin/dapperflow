@@ -1,0 +1,28 @@
+[package]
+name = "dapperflow"
+version = "0.0.0"
+description = "DapperFlow desktop cockpit"
+edition = "2021"
+rust-version = "1.85"
+
+# A standalone workspace so the outer cargo workspace (`cargo build`/`test` at the
+# repo root) stays fast and green without needing a built frontend bundle.
+[workspace]
+
+[lib]
+name = "dapperflow_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Enabled by `tauri build`; uses embedded assets instead of the dev server.
+custom-protocol = ["tauri/custom-protocol"]

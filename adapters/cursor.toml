@@ -1,0 +1,43 @@
+# Cursor Agent CLI adapter manifest (docs/spec/adapters.md).
+#
+# Correction (Phase 2, the design notes): the `cursor` binary is the
+# DESKTOP EDITOR shim that opens the GUI; the agent CLI is `cursor-agent` (alias of
+# `agent`). Flags below are VERIFIED-LOCAL [L] from `cursor-agent --help` at version
+# 2026.07.01-41b2de7 on this machine. Signals, composer, dialog, and interrupt/exit
+# behavior are still UNPROBED, so this manifest stays conservative and keeps
+# no_auto_steer = true until the Cursor capability audit (Phase 2 checklist).
+
+[adapter]
+name = "cursor"
+command = "cursor-agent"
+launch = ["{command}", "{model_flag}", "{prompt}"]   # [L] positional prompt: agent "prompt..."
+autonomy_flags = []                                   # -f/--force, --yolo, --auto-review available [L], not defaulted
+model_flag = ["--model", "{model}"]                   # [L] --model <model> (e.g. gpt-5, sonnet-4-thinking)
+effort_flag = []                                      # no dedicated effort flag; effort rides in parameterized model syntax
+env = {}
+# Absolute until the Cursor capability audit: its composer/signals are unprobed, so
+# automated steering is refused with a Needs You explanation.
+no_auto_steer = true
+
+[signals]
+busy_signature = "esc to interrupt"   # [S] generic guess, unprobed
+native = "none"                        # unaudited; -p --output-format stream-json headless [L]
+
+[controls]
+interrupt = "escape"    # [S] unprobed
+exit_command = "/quit"  # [S] unprobed
+resume = ["{command}", "--resume", "{resume_ref}"]   # [L] --resume [chatId], --continue for most recent
+skill_invocation = "/{skill}"                        # [S] unprobed
+
+[dialogs]
+# Headless --trust skips the workspace prompt; interactive trust text is unprobed.
+trust = { pattern = "trust", response = "enter" }   # [S]
+
+[composer]
+popup_prefixes = ["/"]
+popup_settle_ms = 1500
+ghost_text_styles = ["dim"]
+
+[capabilities]
+mcp = true          # [L] --approve-mcps, plugin/MCP support in --help
+native_tier2 = "unaudited (headless -p --output-format stream-json)"

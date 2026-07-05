@@ -1,0 +1,14 @@
+# DapperFlow house formatting style.
+#
+# The crates are written compact: short function calls, struct literals, and
+# closures stay on one line rather than exploding across many. `use_small_heuristics
+# = "Max"` encodes that intent (the per-construct width heuristics scale up to
+# `max_width`); `max_width = 100` is the conventional wrap point.
+#
+# NOTE (see docs/spec/cicd.md, "Formatting gate"): the crate sources predate any
+# `cargo fmt` enforcement and are not yet normalized to this (or any) config, so
+# `cargo fmt --check` currently reports drift. The CI `rust-fmt` job runs the check
+# in advisory mode (continue-on-error) until a one-time `cargo fmt` normalization
+# pass lands in the crates lane; flip it to a blocking gate once that commit is green.
+use_small_heuristics = "Max"
+max_width = 100

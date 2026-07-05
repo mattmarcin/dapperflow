@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Plan - Broken render (audit fixture)</title>
+<style>
+  :root { --bg:#0f1217; --panel:#161b23; --line:#232b36; --ink:#e9e7e2; --dim:#99a1ae; --brass:#e6a23c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:"Segoe UI",system-ui,sans-serif; font-size:14px; }
+  .doc { padding: 28px; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 15px; color: var(--dim); }
+  /* A. Page-level horizontal overflow: a fixed 1500px block wider than the frame. */
+  .too-wide { width: 1500px; background: var(--panel); border:1px solid var(--line); padding:14px; border-radius:8px; margin: 12px 0; }
+  /* B. Element crossing the right viewport edge. */
+  .off-edge { position: relative; left: 60%; width: 700px; background:#1d2530; padding:12px; border-radius:8px; }
+  /* C. Clipped text: fixed short height with hidden overflow swallows the content. */
+  .clipped { height: 34px; overflow: hidden; background: var(--panel); border:1px solid var(--line); padding:8px; border-radius:6px; }
+  /* D. Overlapping text: two absolutely-positioned lines stacked on the same spot. */
+  .overlap-wrap { position: relative; height: 70px; margin: 16px 0; background: var(--panel); border-radius:8px; }
+  .overlap-a { position:absolute; top:20px; left:16px; font-size:20px; font-weight:700; }
+  .overlap-b { position:absolute; top:24px; left:18px; font-size:20px; color: var(--brass); }
+</style>
+</head>
+<body>
+<div class="doc">
+  <h1>Payment reconciliation plan</h1>
+  <p>This artifact renders badly on purpose - it exercises every layout-audit finding kind.</p>
+
+  <h2>Off-origin reference (blocked by CSP; flagged by the audit)</h2>
+  <!-- E. External reference: connect/img off the artifact origin. Real CSP blocks it;
+       the audit flags it as an error regardless. -->
+  <img src="https://cdn.example.com/analytics-pixel.png" alt="tracking pixel" width="120" height="40" />
+
+  <h2>A ledger table that is far too wide</h2>
+  <div class="too-wide">
+    account 0x91af..3c2 | debit 12,400.00 | credit 0.00 | balance 88,120.55 | reconciled_at 2026-07-04T18:22:09Z | note this row is intentionally wider than the review frame
+  </div>
+
+  <div class="off-edge">This box starts at 60% and is 700px wide, so it runs off the right edge of the review frame.</div>
+
+  <h2>Clipped acceptance criteria</h2>
+  <div class="clipped">
+    The reconciliation job must be idempotent, must never double-post a ledger entry, and must alert on any unmatched transaction older than 24 hours - but this box is only tall enough to show the first line.
+  </div>
+
+  <div class="overlap-wrap">
+    <div class="overlap-a">Settlement window</div>
+    <div class="overlap-b">Settlement window</div>
+  </div>
+</div>
+</body>
+</html>
