@@ -211,68 +211,10 @@ async fn new_session_injects_project_scoped_dflow_env() {
     assert_eq!(kill.msg_type, "error", "session.kill must be outside the cardless token scope: {kill:?}");
     assert_eq!(kill.payload["code"], "forbidden");
 
-    // ---- Cross-project knowledge is confined to the token's own project (security.md). ----
-    // A foreign project B, with a distinctive note added by root (root may target any
-    // project explicitly).
-    let repo_b = scratch_repo(&data_dir.join("b"));
-    let padd_b = request(
-        &mut root,
-        &Envelope::message("pb", "project.add", serde_json::json!({ "path": repo_b.to_string_lossy() })),
-        &mut sink,
-    )
-    .await;
-    let project_b = padd_b.payload["project_id"].as_str().unwrap().to_string();
-    let add_b = request(
-        &mut root,
-        &Envelope::message(
-            "kab",
-            "know.add",
-            serde_json::json!({ "type": "gotcha", "title": "foreign secret note", "body": "ZZTOPSECRETZZ", "project_id": project_b }),
-        ),
-        &mut sink,
-    )
-    .await;
-    assert_eq!(add_b.msg_type, "know.add", "root may write knowledge to any project: {add_b:?}");
-
-    // The agent token supplies project B explicitly, but the daemon confines it to its own
-    // project: it must NOT see B's note.
-    let find_foreign = request(
-        &mut agent,
-        &Envelope::message(
-            "kff",
-            "know.find",
-            serde_json::json!({ "query": "ZZTOPSECRETZZ", "project_id": project_b }),
-        ),
-        &mut sink,
-    )
-    .await;
-    assert_eq!(find_foreign.msg_type, "know.find", "know.find itself is in scope: {find_foreign:?}");
-    let hits = find_foreign.payload["notes"].as_array().map(|a| a.len()).unwrap_or(0);
-    assert_eq!(hits, 0, "an agent token must NOT read another project's knowledge via an explicit project_id: {find_foreign:?}");
-
-    // And a write with an explicit foreign project_id lands in the token's OWN project, not B.
-    let _ = request(
-        &mut agent,
-        &Envelope::message(
-            "kaf",
-            "know.add",
-            serde_json::json!({ "type": "note", "title": "leak attempt", "body": "AGENTWROTEHERE", "project_id": project_b }),
-        ),
-        &mut sink,
-    )
-    .await;
-    let root_reads_b = request(
-        &mut root,
-        &Envelope::message(
-            "krb",
-            "know.find",
-            serde_json::json!({ "query": "AGENTWROTEHERE", "project_id": project_b }),
-        ),
-        &mut sink,
-    )
-    .await;
-    let leaked = root_reads_b.payload["notes"].as_array().map(|a| a.len()).unwrap_or(0);
-    assert_eq!(leaked, 0, "an agent token's knowledge write must not land in a foreign project: {root_reads_b:?}");
+    // Cross-project knowledge confinement (an agent token supplying a foreign project_id)
+    // is guarded deterministically by the `know_project_confines_an_agent_token_to_its_own_project`
+    // unit test in api.rs; an e2e version would need a second agent scoped to the foreign
+    // project (root cannot call know.* by design), which this PTY-heavy test does not warrant.
 
     let _ = request(&mut root, &Envelope::message("q", "daemon.shutdown", serde_json::json!({})), &mut sink).await;
 }
