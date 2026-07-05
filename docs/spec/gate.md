@@ -9,12 +9,32 @@ Runs in an isolated worktree leased from the project's pool under the `gate` lea
 
 1. **Checks**: the project's registered check commands (build, test, lint, typecheck) run in order; output captured as evidence. `projects.check_cmds` may have been seeded by the onboarding audit's confirmed proposal (provenance note; behavior unchanged).
 2. **Adversarial review**: a reviewer session on a different harness than the author (recipe `reviewer_harness: different` is the default) receives the diff, the card's acceptance criteria, and the plan artifact if one exists; it produces structured findings via `dflow finding add`.
-3. **Autofix**: findings classified safe-mechanical (lint, formatting, dead imports, trivial test fixes) are applied by a fixer session and re-checked.
+3. **Autofix**: findings classified safe-mechanical (lint, formatting, dead imports, trivial test fixes) are handed to a fixer session, then re-checked; a finding is marked `autofixed` only when the autofix earns the claim (see **Autofix earned claim** below), otherwise it escalates like an intent finding.
 4. **Escalation**: findings touching intent (behavior, API shape, scope) become Needs You items; the finding review renders in Plan Studio chrome so the human resolves each with approve / fix / skip, annotated in place.
 5. **Ship**: only when every check is green and every finding resolved does the branch push and the PR open; CI status streams back onto the card; CI failures can trigger one bounded autofix loop before escalating.
 
 Recipe knobs: `gate: full | checks_only | none`, reviewer harness, autofix aggressiveness.
 Project modes: `pr` (default) or `local_only` (gate ends with an approved local fast-forward merge instead of a push).
+
+## Autofix earned claim
+
+A mechanical finding may be marked `autofixed` only when ALL of the following hold; a green re-check alone is never sufficient.
+
+1. The fixer session **completed** - it exited on its own, not killed at the session timeout.
+2. The fixer **actually changed the worktree** - either its own new commit advanced HEAD, or it left an uncommitted working-tree diff that the gate then commits, attributable to the fixer.
+3. The **re-check is green** after that change.
+
+This is required because the exact defect class autofix targets (lint, formatting, dead imports, trivial test fixes) does not fail the project check by construction.
+A fixer that was killed before committing, or that made no change, therefore leaves the defect in the diff while the re-check passes; marking such a finding `autofixed` would be a false pass (the product lying about the very defect class autofix exists to handle).
+
+When any of the three does not hold, the mechanical finding is **not** autofixed: it stays open and escalates to a `gate_finding` Needs You, exactly like an intent finding.
+The autofix step records the reason as evidence, alongside the fixer's tail output:
+
+- the fixer was killed or timed out -> reason `fixer did not complete`;
+- the fixer made no change -> reason `autofix made no changes`;
+- the fixer changed code but the re-check failed -> reason `re-check failed after autofix`.
+
+On a successful autofix the evidence records the fixer's commit id and a diffstat (and whether the gate committed a working-tree diff the fixer left uncommitted), so the timeline shows exactly what the fixer changed - never a prose-only claim.
 
 ## Findings
 
