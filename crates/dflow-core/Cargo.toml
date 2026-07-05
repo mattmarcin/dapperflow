@@ -26,4 +26,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
     "Win32_Security_Cryptography",
+    # Reaping-job membership query + process-table snapshot: prove the ConPTY console
+    # host is assigned to the daemon's kill-on-close Job Object (`job.rs`).
+    "Win32_System_JobObjects",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }

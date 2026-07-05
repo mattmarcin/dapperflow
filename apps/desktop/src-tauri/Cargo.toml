@@ -17,11 +17,20 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Best-effort pid-liveness check when resolving the daemon runtime file (a stale runtime
+# file whose daemon pid is dead must not fool the attach path). Windows-only; small,
+# targeted surface (OpenProcess).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [features]
 # Enabled by `tauri build`; uses embedded assets instead of the dev server.

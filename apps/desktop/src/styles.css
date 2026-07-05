@@ -2101,9 +2101,22 @@ select.field-input {
   color: var(--brass);
   letter-spacing: 0.04em;
 }
+.status-mode {
+  padding: 1px 8px;
+  margin-right: 10px;
+  border: 1px solid var(--line, rgba(255, 255, 255, 0.12));
+  border-radius: 999px;
+  color: var(--text-faint);
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+}
 .status-build {
   color: var(--text-faint);
   letter-spacing: 0.04em;
+}
+/* The keep-alive toggle reuses the remote toggle row; give it breathing room. */
+.daemon-keepalive {
+  margin-top: 14px;
 }
 
 /* ---- Toast -------------------------------------------------------------- */

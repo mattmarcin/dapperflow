@@ -16,6 +16,7 @@ import { AuditOfferModal } from "./components/AuditOfferModal";
 import { TopBar } from "./components/TopBar";
 import { ConcertmasterPanel } from "./components/concertmaster/ConcertmasterPanel";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 
 export function App() {
   return (
@@ -121,8 +122,30 @@ function Shell() {
       {store.newSessionOpen ? <NewSessionModal /> : null}
       <GrantModal />
       <AuditOfferModal />
+      <TrayStopConfirm />
       <ToastHost />
     </div>
+  );
+}
+
+// The confirm for a tray-initiated "Stop daemon" when live sessions exist (the tray menu
+// routes through the store so it reuses the same graceful stop + confirm as the buttons).
+function TrayStopConfirm() {
+  const { pendingStopConfirm, liveSessionCount, confirmStopDaemon, cancelStopDaemon } = useStore();
+  if (!pendingStopConfirm) return null;
+  return (
+    <ConfirmDialog
+      title="Stop the daemon?"
+      body={
+        liveSessionCount > 0
+          ? `${liveSessionCount} live session${liveSessionCount === 1 ? "" : "s"} will be interrupted. They keep their transcript and worktree and become resumable when the daemon restarts.`
+          : "The daemon will stop. No live sessions are running, so nothing is interrupted."
+      }
+      confirmLabel="Stop daemon"
+      tone="danger"
+      onConfirm={confirmStopDaemon}
+      onCancel={cancelStopDaemon}
+    />
   );
 }
 

@@ -12,7 +12,7 @@ import { useStore } from "../state/store";
 // blip does not flash), holds steady through the whole retry cycle, and clears
 // cleanly only once the daemon is truly connected again.
 export function DaemonBanner() {
-  const { daemon, fixtureMode } = useStore();
+  const { daemon, fixtureMode, daemonMode, daemonHint } = useStore();
   const [visible, setVisible] = useState(false);
   const graceTimer = useRef<number>();
 
@@ -49,11 +49,23 @@ export function DaemonBanner() {
   // "absent" is the daemon we could not reach at all (start it); every other degraded
   // state is a live daemon we lost and are reconnecting to.
   const offline = daemon === "absent";
+  // In dev-external mode the app deliberately does NOT spawn the daemon, so the honest
+  // message is "start the dev daemon" (with the exact command), not "start dflowd".
+  const devExternal = offline && daemonMode === "dev-external";
   return (
     <div className={`daemon-banner${offline ? "" : " is-reconnecting"}`} role="status" aria-live="polite">
       <span className="daemon-banner-dot" aria-hidden />
       <span className="daemon-banner-text">
-        {offline ? (
+        {devExternal ? (
+          <>
+            Dev mode: the app connects to an externally-run daemon and does not start one.{" "}
+            {daemonHint ?? (
+              <>
+                Start it with <code>just daemon-dev</code>, then reconnect.
+              </>
+            )}
+          </>
+        ) : offline ? (
           <>
             Daemon offline. Live terminals are unavailable
             {fixtureMode ? "; the board is running on dev fixtures." : "."} Start{" "}

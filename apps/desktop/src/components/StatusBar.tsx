@@ -17,12 +17,14 @@ const STATUS_LABEL: Record<string, string> = {
 // unkillable.
 export function StatusBar() {
   const store = useStore();
-  const { daemon, daemonPort, daemonVersion, daemonStarted, cards, sessions, launches, fixtureMode } = store;
+  const { daemon, daemonPort, daemonVersion, daemonStarted, daemonMode, cards, sessions, launches, fixtureMode } =
+    store;
   const { openMenu } = useContextMenu();
   const [confirmStop, setConfirmStop] = useState(false);
 
   const liveCount = sessions.filter((s) => isLive(s.state)).length + launches.filter((l) => l.alive).length;
   const connected = daemon === "connected";
+  // "started" = this run spawned the daemon; "attached" = connected to a running one.
   const originLabel = daemonStarted ? "started" : "attached";
 
   const openDaemonMenu = (e: { clientX: number; clientY: number; preventDefault?: () => void }) => {
@@ -59,6 +61,11 @@ export function StatusBar() {
       <Segment label="live" value={String(liveCount)} muted={liveCount === 0} />
       <span className="status-spacer" />
       {fixtureMode ? <span className="status-fixture">fixture data</span> : null}
+      {daemonMode === "dev-external" ? (
+        <span className="status-mode" title="Development: the app connects to an externally-run daemon (just daemon-dev)">
+          dev daemon
+        </span>
+      ) : null}
       <span className="status-build">{daemonVersion ?? "dflowd"}</span>
 
       {confirmStop ? (

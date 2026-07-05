@@ -8,13 +8,21 @@ import { ConfirmDialog } from "../ConfirmDialog";
 // means unkillable.
 export function DaemonSection() {
   const store = useStore();
-  const { daemon, daemonPort, daemonVersion, daemonStarted, sessions, launches } = store;
+  const { daemon, daemonPort, daemonVersion, daemonStarted, daemonMode, keepAlive, setKeepAlive, sessions, launches } =
+    store;
   const [confirmStop, setConfirmStop] = useState(false);
 
   const liveCount = sessions.filter((s) => isLive(s.state)).length + launches.filter((l) => l.alive).length;
   const connected = daemon === "connected";
   const statusText =
     daemon === "connected" ? "Running" : daemon === "absent" ? "Offline" : daemon === "disconnected" ? "Reconnecting" : "Connecting";
+  const modeText =
+    daemonMode === "dev-external"
+      ? "Dev (external)"
+      : daemonMode === "prod-managed"
+        ? "App-managed"
+        : "--";
+  const devExternal = daemonMode === "dev-external";
 
   return (
     <div className="agents-section">
@@ -31,15 +39,46 @@ export function DaemonSection() {
       <div className="settings-card">
         <div className="daemon-grid">
           <Stat label="Status" value={statusText} tone={connected ? "good" : daemon === "absent" ? "bad" : undefined} />
+          <Stat label="Mode" value={modeText} />
           <Stat label="Port" value={daemonPort ? String(daemonPort) : "--"} />
           <Stat label="Live sessions" value={String(liveCount)} />
           <Stat label="This run" value={daemonStarted === undefined ? "--" : daemonStarted ? "started it" : "attached"} />
           <Stat label="Version" value={daemonVersion ?? "--"} />
         </div>
         <p className="settings-note">
-          PID and uptime need a <code>daemon.info</code> verb the Phase 2 core has not served yet; they appear here
-          once it lands.
+          {devExternal ? (
+            <>
+              Development mode: the app connects to a daemon you run yourself (<code>just daemon-dev</code>) and never
+              spawns one, so rebuilds never fight an exe lock. Stop/Restart here act on that external daemon.
+            </>
+          ) : (
+            <>
+              The app owns a bundled daemon copied to a stable location and spawns it detached, so it outlives the
+              window and updates cleanly. PID and uptime appear once the <code>daemon.info</code> verb lands.
+            </>
+          )}
         </p>
+
+        <div className="remote-toggle-row daemon-keepalive">
+          <div className="remote-toggle-text">
+            <span className="remote-toggle-title">Keep agents running when I close the window</span>
+            <span className="remote-toggle-sub">
+              {keepAlive
+                ? "On. Closing the window leaves the daemon and its agents running; reopen to reconnect."
+                : "Off. Quitting the app gracefully stops the daemon, so nothing lingers (sessions become resumable)."}
+            </span>
+          </div>
+          <button
+            role="switch"
+            aria-checked={keepAlive}
+            className={`switch${keepAlive ? " is-on" : ""}`}
+            onClick={() => setKeepAlive(!keepAlive)}
+            title={keepAlive ? "Stop the daemon when I quit" : "Keep the daemon running when I quit"}
+          >
+            <span className="switch-knob" aria-hidden />
+          </button>
+        </div>
+
         <div className="settings-actions">
           <button className="btn-ghost btn-sm" onClick={() => store.restartDaemon()} disabled={!connected}>
             Restart daemon

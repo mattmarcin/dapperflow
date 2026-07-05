@@ -31,6 +31,14 @@ fn main() -> Result<()> {
         std::env::set_var("DFLOW_DATA_DIR", dir);
     }
 
+    // `--version`/`-V`: print the build string and exit. The desktop app runs this on the
+    // bundled and the installed daemon to decide whether to refresh its managed copy
+    // (`daemon-lifecycle.md` / Production: copy when the bundled version is newer).
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{VERSION}");
+        return Ok(());
+    }
+
     // Lifecycle control verbs exit without starting a daemon.
     if args.iter().any(|a| a == "--status") {
         return control::status();
@@ -76,6 +84,16 @@ async fn run_daemon() -> Result<()> {
             return Ok(());
         }
     };
+
+    // Total reaping foundation (`daemon-lifecycle.md`): assign this daemon process to a
+    // kill-on-close Job Object BEFORE any session (and its ConPTY console host) can be
+    // spawned, so every descendant dies with the daemon however it dies. Non-fatal: on
+    // failure the per-session kill guards still bound each tree.
+    if let Err(err) = dflow_core::install_process_reaping_job() {
+        tracing::error!(%err, "could not install the process reaping job; a hard daemon kill may orphan ConPTY hosts");
+    } else {
+        tracing::info!("process reaping job installed: children die with the daemon");
+    }
 
     tracing::info!(dir = %runtime.dir().display(), "dflowd starting");
     server::run(runtime, VERSION.to_string()).await
