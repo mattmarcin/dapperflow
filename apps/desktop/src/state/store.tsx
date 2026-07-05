@@ -187,13 +187,20 @@ export interface StoreValue {
   createCard: (input: CardCreateInput) => Promise<Card>;
   moveCard: (cardId: string, lane: Lane, opts?: { silent?: boolean }) => Promise<void>;
   addProject: (path: string) => Promise<ProjectAddResult>;
-  dispatch: (input: DispatchStartInput) => Promise<void>;
+  // dispatch.start; resolves to the started session id (the CLI the card just
+  // dispatched) so the caller can open its live terminal, or null if the daemon
+  // returned no id. A dispatch parked behind the recipe consent modal still throws
+  // the GRANT_PENDING marker.
+  dispatch: (input: DispatchStartInput) => Promise<string | null>;
   cancelDispatch: (cardId: string) => void;
   renameSession: (sessionId: string, title: string) => void;
 
   // live terminal bindings (one-click-to-terminal)
   terminalsFor: (cardId: string) => TerminalBinding[];
   startTerminal: (cardId: string, harness: string) => Promise<string>;
+  // Bind an already-created daemon session (e.g. a dispatch.start result) to a card's
+  // terminal tab, reusing the pool + attach flow instead of spawning a fresh PTY.
+  bindTerminal: (cardId: string, sessionId: string, harness: string) => void;
   renameTerminal: (cardId: string, sessionId: string, title: string) => void;
   closeTerminal: (cardId: string, sessionId: string) => void;
   cardEvents: (cardId: string) => Promise<CardEvent[]>;
@@ -620,6 +627,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
   const closeSession = useCallback(() => setOpenSessionId(null), []);
 
+  // Primary navigation (Sidebar: Mission Control / Board / Settings, the Projects tree's
+  // "Open on board", @-mentions to a project). Switching the top-level view must also
+  // dismiss any open card/session overlay: those render on top of the view regardless of
+  // it, and the pooled terminal is glued over the session slot, so without clearing them
+  // the live CLI stays visible over the newly-selected pane (only "Back" cleared it
+  // before). Clearing hides the terminal via the pool (never evicts), so reopening the
+  // same session re-shows the live terminal with no re-attach. Callers that navigate to a
+  // specific card/session (openNeedsYou, notification routing) use the raw view setter and
+  // then open the overlay, so they are unaffected.
+  const changeView = useCallback((next: AppView) => {
+    setView(next);
+    setOpenSessionId(null);
+    setOpenCardId(null);
+  }, []);
+
   const startSession = useCallback(async (input: SessionStartInput): Promise<string> => {
     const client = clientRef.current;
     if (!client || !client.connected)
@@ -837,7 +859,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const dispatch = useCallback(
-    async (input: DispatchStartInput) => {
+    async (input: DispatchStartInput): Promise<string | null> => {
       // Trust-tier gate (security.md): resolve the card's effective recipe; an
       // ungranted privileged recipe parks the dispatch behind the consent modal and
       // throws the marker so callers skip their failure toast. The daemon enforces
@@ -854,8 +876,12 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         setPendingGrant(recipeGrantError(recipe, card?.project_id ?? ""));
         throw new Error(GRANT_PENDING_MESSAGE);
       }
-      await sourceRef.current!.dispatch({ ...input, recipe: input.recipe ?? recipeName });
+      // dispatch.start leases a worktree and launches the recipe's harness, returning the
+      // new session id. Hand it back so the card's Terminal tab can open that exact live
+      // CLI (the same terminal-pool + attach flow New Session uses).
+      const res = await sourceRef.current!.dispatch({ ...input, recipe: input.recipe ?? recipeName });
       await refresh();
+      return res?.session_id ?? null;
     },
     [refresh],
   );
@@ -886,6 +912,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     bindingsRef.current.set(cardId, [...list, { sessionId: session_id, harness }]);
     forceTick((n) => n + 1);
     return session_id;
+  }, []);
+
+  const bindTerminal = useCallback((cardId: string, sessionId: string, harness: string) => {
+    // Register an already-live daemon session (a dispatch.start result) as a card
+    // terminal. Idempotent: re-binding the same id just refreshes the harness label so a
+    // repeat dispatch never stacks duplicate tabs. The pool attaches to the existing PTY.
+    const list = bindingsRef.current.get(cardId) ?? [];
+    const existing = list.find((b) => b.sessionId === sessionId);
+    if (existing) {
+      bindingsRef.current.set(
+        cardId,
+        list.map((b) => (b.sessionId === sessionId ? { ...b, harness } : b)),
+      );
+    } else {
+      bindingsRef.current.set(cardId, [...list, { sessionId, harness }]);
+    }
+    forceTick((n) => n + 1);
   }, []);
 
   const renameTerminal = useCallback((cardId: string, sessionId: string, title: string) => {
@@ -1154,7 +1197,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       requestNotificationPermission,
       resumeSession,
       view,
-      setView,
+      setView: changeView,
       filterProjectId,
       setFilterProject: setFilterProjectId,
       openCardId,
@@ -1205,6 +1248,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       renameSession,
       terminalsFor,
       startTerminal,
+      bindTerminal,
       renameTerminal,
       closeTerminal,
       cardEvents,
@@ -1258,6 +1302,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       requestNotificationPermission,
       resumeSession,
       view,
+      changeView,
       filterProjectId,
       openCardId,
       workspaceTab,
@@ -1305,6 +1350,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       renameSession,
       terminalsFor,
       startTerminal,
+      bindTerminal,
       renameTerminal,
       closeTerminal,
       cardEvents,

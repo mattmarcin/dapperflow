@@ -51,7 +51,10 @@ export function IssueTab({ card, sessions }: Props) {
     if (busy) return;
     setBusy(true);
     try {
-      await store.dispatch({ card_id: card.id, harness });
+      // Bind the dispatched session so the Terminal tab shows its live CLI (same pool +
+      // attach flow as New Session), rather than auto-spawning a bare shell there.
+      const sid = await store.dispatch({ card_id: card.id, harness });
+      if (sid) store.bindTerminal(card.id, sid, harness);
       store.flash(`Dispatched ${harness} to fix ${issueRef(card)}.`);
       store.setWorkspaceTab("terminal");
     } catch (e) {
