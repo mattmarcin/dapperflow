@@ -606,8 +606,18 @@ fn run_review(
     Ok(())
 }
 
-/// Autofix: hand every open safe-mechanical finding to a fixer session, re-run checks, and
-/// mark the mechanical findings `autofixed` when the checks stay green (`gate.md` / Autofix).
+/// Autofix: hand every open safe-mechanical finding to a fixer session, then mark those
+/// findings `autofixed` only when the autofix EARNS the claim (`gate.md` / Autofix). A
+/// mechanical finding resolves `autofixed` only when BOTH observable conditions hold: the
+/// fixer actually CHANGED the worktree - a new commit, or an uncommitted working-tree diff
+/// the gate then commits attributable to the fixer - AND the re-check stays GREEN. Anything
+/// else escalates honestly: the mechanical findings stay open (so the pipeline routes them
+/// to a `gate_finding` Needs You) and the reason is recorded in the autofix `gate_step`
+/// evidence with the fixer's tail output. This closes the audit's false pass: the defect
+/// class autofix targets (lint, dead imports, formatting) does not fail checks, so a green
+/// re-check alone never proves a fix landed. (Session completion is not a usable gate here:
+/// on Windows ConPTY a cleanly-exited fixer is never observed to exit, so `finished` only
+/// refines the escalation reason - it never blocks a real, green change from autofixing.)
 fn run_autofix(
     state: &AppState,
     ctx: &PipelineCtx,
@@ -630,22 +640,66 @@ fn run_autofix(
     state.store.set_gate_run_step(&ctx.gate_run_id, gate_step::AUTOFIX).map_err(|e| e.to_string())?;
     let fixer_harness = fixer_harness(&ctx.author_harness);
     let brief = compose_fixer_brief(ctx, &mechanical);
+
+    // Capture the pre-fixer tree state so any change can be attributed to the fixer.
+    let before_head = git_head_sha(cwd);
+    let before_status = git_status_porcelain(cwd);
+
     let sid = spawn_gate_session(state, &fixer_harness, &brief, cwd, ctx, env, worktree_id)?;
     let finished = wait_for_session_exit(state, &sid, session_timeout());
 
-    // Re-check after the fixer's edits; the mechanical findings only resolve if green.
+    // Grab the fixer's tail output for evidence before the session is reaped; scrubbed.
+    let tail = fixer_tail(state, &sid, secrets);
+    let tail_log = evidence_dir.join("autofix-fixer.log");
+    let _ = std::fs::write(&tail_log, &tail);
+    let tail_log = tail_log.to_string_lossy().into_owned();
+
+    // Earned-claim: mark `autofixed` only when the fixer actually CHANGED the worktree and
+    // the re-check stays GREEN. `finished` refines the escalation reason but must NOT gate
+    // success: on Windows ConPTY the daemon holds the PTY master for the session's whole
+    // life, so a cleanly-exited fixer is never observed to exit (`is_alive` stays true until
+    // we kill it at the session timeout). Gating success on `finished` would falsely escalate
+    // every autofix. The observable proxy for "the fixer did the work" is a real change plus a
+    // green re-check, which also subsumes the "killed before it did anything" case (no change
+    // -> escalate).
+    let Some(change) = attribute_fixer_change(cwd, &before_head, &before_status)? else {
+        // No change landed. A fixer we had to kill at the timeout "did not complete"; one we
+        // observed exit cleanly "made no changes".
+        return escalate_autofix(state, ctx, &fixer_harness, &sid, no_change_reason(finished), &tail, &tail_log);
+    };
+    // The fixer's change advanced HEAD; record it for the ship path and the evidence.
+    let _ = state.store.set_gate_run_head(&ctx.gate_run_id, &change.head);
+
+    // (c) The re-check must stay green after the fixer's change.
     let rechecked = run_checks(state, ctx, cwd, env, secrets, evidence_dir)?;
-    if rechecked {
-        for f in &mechanical {
-            let _ = state.store.resolve_finding(&f.id, resolution::AUTOFIXED);
-        }
-        // The fixer's commits advanced HEAD; record the new head for the ship path.
-        if let Ok(new_head) = git_capture(cwd, &["rev-parse", "HEAD"]) {
-            let new_head = new_head.trim().to_string();
-            if !new_head.is_empty() {
-                let _ = state.store.set_gate_run_head(&ctx.gate_run_id, &new_head);
-            }
-        }
+    if !rechecked {
+        // The fixer changed code but the checks now fail: do not claim autofixed. The
+        // still-open mechanical findings (plus any new check finding) escalate.
+        state
+            .store
+            .record_gate_step(
+                &ctx.card_id,
+                &ctx.gate_run_id,
+                gate_step::AUTOFIX,
+                "failed",
+                serde_json::json!({
+                    "fixer_harness": fixer_harness,
+                    "session_id": sid,
+                    "session_finished": finished,
+                    "reason": "re-check failed after autofix",
+                    "fixer_commit": change.head,
+                    "diffstat": change.diffstat,
+                    "gate_committed_worktree": change.gate_committed,
+                    "fixer_tail_log": tail_log,
+                }),
+            )
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    // Earned: the fixer completed, changed the worktree, and the re-check is green.
+    for f in &mechanical {
+        let _ = state.store.resolve_finding(&f.id, resolution::AUTOFIXED);
     }
     state
         .store
@@ -653,17 +707,144 @@ fn run_autofix(
             &ctx.card_id,
             &ctx.gate_run_id,
             gate_step::AUTOFIX,
-            if rechecked { "passed" } else { "failed" },
+            "passed",
             serde_json::json!({
                 "fixer_harness": fixer_harness,
                 "session_id": sid,
                 "session_finished": finished,
                 "applied": mechanical.len(),
                 "rechecked_green": rechecked,
+                "fixer_commit": change.head,
+                "diffstat": change.diffstat,
+                "gate_committed_worktree": change.gate_committed,
             }),
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// A change the fixer landed in the gate worktree, attributed for the earned autofix claim.
+struct FixerChange {
+    /// The commit sha now at HEAD - the fixer's own commit, or the gate's commit of a
+    /// working-tree diff the fixer left uncommitted.
+    head: String,
+    /// A short diffstat from the pre-fixer HEAD to `head`, for evidence.
+    diffstat: String,
+    /// Whether the gate itself committed a working-tree diff the fixer left uncommitted.
+    gate_committed: bool,
+}
+
+/// Attribute a fixer's change to the gate worktree (`gate.md` / Autofix, earned-claim
+/// criterion (b)). A new commit is the fixer's own; an uncommitted working-tree diff is
+/// committed by the gate and attributed to the fixer. Returns `None` when the fixer changed
+/// nothing (HEAD unmoved and the porcelain status identical to before it ran - which
+/// ignores pre-existing dirt like a reviewer session's marker file).
+fn attribute_fixer_change(
+    cwd: &Path,
+    before_head: &str,
+    before_status: &str,
+) -> Result<Option<FixerChange>, String> {
+    let after_head = git_head_sha(cwd);
+    if !after_head.is_empty() && after_head != before_head {
+        // The fixer committed its own change; that commit is the attribution.
+        let diffstat = git_capture(cwd, &["diff", "--stat", before_head, &after_head]).unwrap_or_default();
+        return Ok(Some(FixerChange { head: after_head, diffstat, gate_committed: false }));
+    }
+
+    // No new commit: did the fixer leave an uncommitted working-tree diff?
+    if git_status_porcelain(cwd).trim() == before_status.trim() {
+        return Ok(None); // nothing changed since before the fixer ran
+    }
+    // Stage and commit the fixer's working-tree diff, attributable to the fixer. If nothing
+    // is actually staged (e.g. only ignored churn), there is no real change.
+    git_capture(cwd, &["add", "-A"])?;
+    if git_capture(cwd, &["diff", "--cached", "--quiet"]).is_ok() {
+        return Ok(None);
+    }
+    git_capture(cwd, &["commit", "-m", "gate(autofix): commit fixer working-tree changes"])?;
+    let head = git_head_sha(cwd);
+    if head.is_empty() || head == before_head {
+        return Ok(None);
+    }
+    let diffstat = git_capture(cwd, &["diff", "--stat", before_head, &head]).unwrap_or_default();
+    Ok(Some(FixerChange { head, diffstat, gate_committed: true }))
+}
+
+/// `git rev-parse HEAD`, trimmed, or empty on error.
+fn git_head_sha(cwd: &Path) -> String {
+    git_capture(cwd, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// `git status --porcelain`, or empty on error (a stable fingerprint of the working tree).
+fn git_status_porcelain(cwd: &Path) -> String {
+    git_capture(cwd, &["status", "--porcelain"]).unwrap_or_default()
+}
+
+/// The fixer session's tail output (last lines of the visible screen), scrubbed of secrets,
+/// for autofix escalation evidence. Empty when the session is already gone.
+fn fixer_tail(state: &AppState, session_id: &str, secrets: &[String]) -> String {
+    state
+        .sessions
+        .get_str(session_id)
+        .map(|s| s.peek_scrubbed(40, secrets))
+        .unwrap_or_default()
+}
+
+/// Record an escalated autofix step and leave the mechanical findings open, so the pipeline
+/// escalates them to a `gate_finding` Needs You (`gate.md` / Autofix earned-claim,
+/// Escalation). The `reason` and the fixer's tail output are the honest evidence.
+fn escalate_autofix(
+    state: &AppState,
+    ctx: &PipelineCtx,
+    fixer_harness: &str,
+    session_id: &str,
+    reason: &str,
+    tail: &str,
+    tail_log: &str,
+) -> Result<(), String> {
+    state
+        .store
+        .record_gate_step(
+            &ctx.card_id,
+            &ctx.gate_run_id,
+            gate_step::AUTOFIX,
+            "escalated",
+            serde_json::json!({
+                "fixer_harness": fixer_harness,
+                "session_id": session_id,
+                "reason": reason,
+                "fixer_tail": preview_tail(tail),
+                "fixer_tail_log": tail_log,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A short inline preview of the fixer tail for the event payload (the full text is in the
+/// pointed-at log), truncated on a char boundary.
+fn preview_tail(tail: &str) -> String {
+    const MAX: usize = 600;
+    let t = tail.trim();
+    if t.len() <= MAX {
+        return t.to_string();
+    }
+    let mut cut = MAX;
+    while !t.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &t[..cut])
+}
+
+/// The honest escalation reason when the fixer changed nothing (`gate.md` / Autofix earned
+/// claim). A fixer we had to kill at the session timeout "did not complete"; one we observed
+/// exit on its own without changing anything "made no changes".
+fn no_change_reason(finished: bool) -> &'static str {
+    if finished {
+        "autofix made no changes"
+    } else {
+        "fixer did not complete"
+    }
 }
 
 // ---- session spawning ----
@@ -1189,5 +1370,34 @@ pub fn finding_info(f: FindingRow) -> FindingInfo {
         resolution: f.resolution,
         created_at: f.created_at,
         resolved_at: f.resolved_at,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_change_reason_distinguishes_a_timeout_from_a_clean_exit() {
+        // A fixer we observed exit on its own without changing anything made no changes; one
+        // we had to kill at the session timeout did not complete (`gate.md` / Autofix earned
+        // claim). This is the reason branch the E2E stubs cannot exercise deterministically:
+        // on Windows ConPTY every PTY stub is only ever observed as "not finished", so this
+        // unit test pins both arms.
+        assert_eq!(no_change_reason(true), "autofix made no changes");
+        assert_eq!(no_change_reason(false), "fixer did not complete");
+    }
+
+    #[test]
+    fn preview_tail_truncates_on_a_char_boundary() {
+        assert_eq!(preview_tail("  short tail  "), "short tail");
+        let long = "x".repeat(700);
+        let p = preview_tail(&long);
+        assert!(p.ends_with("..."), "a long tail is elided: {p}");
+        assert!(p.len() <= 603, "the preview is bounded: {}", p.len());
+        // A multibyte tail is never split mid-codepoint (would panic on a bad boundary).
+        let multibyte = "é".repeat(400); // 800 bytes
+        let pm = preview_tail(&multibyte);
+        assert!(pm.ends_with("..."), "multibyte tail elided: {pm}");
     }
 }
