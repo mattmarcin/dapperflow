@@ -15,7 +15,8 @@ import {
   useState,
 } from "react";
 import { ConnectionStatus, DflowClient } from "../client";
-import { getDaemonInfo } from "../daemon";
+import { getDaemonInfo, DaemonMode } from "../daemon";
+import { getKeepAlive, onTrayAction, setKeepAlive as setKeepAliveCmd, setTrayStatus } from "../lib/shell";
 import { createDataSource, DataSource, usingFixtures } from "../data";
 import {
   Agent,
@@ -52,6 +53,7 @@ import {
 } from "../model";
 import { ArtifactMeta, FeedbackSubmit, FeedbackSubmitResult } from "../review/protocol";
 import { deriveSessionTitle } from "../lib/format";
+import { isLive } from "../lib/session-state";
 import { needsYouMeta } from "../lib/needs-you";
 import {
   effectiveRecipeName,
@@ -178,10 +180,21 @@ export interface StoreValue {
   daemonPort?: number;
   daemonVersion?: string;
   daemonStarted?: boolean; // this run spawned the daemon vs attached to a running one
+  daemonMode?: DaemonMode; // dev-external (connect only) vs prod-managed (app owns it)
+  daemonHint?: string; // guidance when not connected in dev-external mode
+  liveSessionCount: number; // live PTY sessions + cardless launches (tray + status)
   client: DflowClient | null;
   // Daemon kill switch (companion to the detach fix): stop is explicit, never a nag.
   stopDaemon: () => Promise<void>;
   restartDaemon: () => Promise<void>;
+  // Tray-driven stop routed through a confirm when live sessions exist.
+  requestStopDaemon: () => void;
+  pendingStopConfirm: boolean;
+  confirmStopDaemon: () => void;
+  cancelStopDaemon: () => void;
+  // "Keep agents running when I close the window" (Settings > Daemon), persisted.
+  keepAlive: boolean;
+  setKeepAlive: (value: boolean) => Promise<void>;
 
   // mutations
   createCard: (input: CardCreateInput) => Promise<Card>;
@@ -327,6 +340,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [daemonPort, setDaemonPort] = useState<number>();
   const [daemonVersion, setDaemonVersion] = useState<string>();
   const [daemonStarted, setDaemonStarted] = useState<boolean>();
+  const [daemonMode, setDaemonMode] = useState<DaemonMode>();
+  const [daemonHint, setDaemonHint] = useState<string>();
+  const [keepAlive, setKeepAliveState] = useState(true);
+  const [pendingStopConfirm, setPendingStopConfirm] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
   const toastSeq = useRef(0);
   const toastTimer = useRef<number>();
@@ -468,18 +485,26 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       try {
         const info = await getDaemonInfo();
         if (cancelled) return;
-        setDaemonPort(info.port);
-        setDaemonStarted(info.started);
-        client = new DflowClient(info.port, info.token);
-        client.onStatus = (s) => setDaemon(s);
-        client.onReconnect = () => {
-          // In live mode a reconnect should re-pull the board.
-          if (!fixtureMode) refresh().catch(() => undefined);
-        };
-        await client.connect();
-        if (cancelled) return;
-        setDaemonVersion(client.daemonVersion);
-        clientRef.current = client;
+        setDaemonMode(info.mode);
+        setDaemonHint(info.hint);
+        // Dev-external mode with no live daemon: do NOT connect (there is no port). The
+        // app is a pure client here; the banner shows the hint to start the dev daemon.
+        if (info.connected === false || info.port === 0) {
+          setDaemon("absent");
+        } else {
+          setDaemonPort(info.port);
+          setDaemonStarted(info.started);
+          client = new DflowClient(info.port, info.token);
+          client.onStatus = (s) => setDaemon(s);
+          client.onReconnect = () => {
+            // In live mode a reconnect should re-pull the board.
+            if (!fixtureMode) refresh().catch(() => undefined);
+          };
+          await client.connect();
+          if (cancelled) return;
+          setDaemonVersion(client.daemonVersion);
+          clientRef.current = client;
+        }
       } catch {
         // No daemon reachable. Fixture mode still runs fully; live terminals are
         // unavailable until the daemon is up (handled by the daemon banner).
@@ -1180,6 +1205,64 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     window.setTimeout(() => window.location.reload(), 900);
   }, []);
 
+  // Live count (PTY sessions + cardless launches) - the number that gates the stop
+  // confirm and rides the tray status line.
+  const liveSessionCount =
+    sessions.filter((s) => isLive(s.state)).length + launches.filter((l) => l.alive).length;
+  const liveCountRef = useRef(0);
+  liveCountRef.current = liveSessionCount;
+
+  // Tray-driven stop routes through the same confirm-when-live UX as the buttons.
+  const requestStopDaemon = useCallback(() => {
+    if (liveCountRef.current > 0) setPendingStopConfirm(true);
+    else stopDaemon();
+  }, [stopDaemon]);
+  const confirmStopDaemon = useCallback(() => {
+    setPendingStopConfirm(false);
+    stopDaemon();
+  }, [stopDaemon]);
+  const cancelStopDaemon = useCallback(() => setPendingStopConfirm(false), []);
+
+  const setKeepAlive = useCallback(async (value: boolean) => {
+    setKeepAliveState(value);
+    await setKeepAliveCmd(value).catch(() => undefined);
+  }, []);
+
+  // Load the persisted keep-alive setting once at boot.
+  useEffect(() => {
+    getKeepAlive()
+      .then(setKeepAliveState)
+      .catch(() => undefined);
+  }, []);
+
+  // Keep the tray status line current (running + live count, or offline/connecting).
+  useEffect(() => {
+    const text =
+      daemon === "connected"
+        ? `Daemon: running · ${liveSessionCount} session${liveSessionCount === 1 ? "" : "s"}`
+        : daemon === "absent"
+          ? "Daemon: offline"
+          : "Daemon: connecting…";
+    setTrayStatus(text).catch(() => undefined);
+  }, [daemon, liveSessionCount]);
+
+  // Wire tray menu actions (Stop/Restart) to the same flows the in-app controls use.
+  // Registered once; reads current actions/counts through refs so it never goes stale.
+  const stopActionsRef = useRef({ requestStopDaemon, restartDaemon });
+  stopActionsRef.current = { requestStopDaemon, restartDaemon };
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onTrayAction((action) => {
+      if (action === "stop-daemon") stopActionsRef.current.requestStopDaemon();
+      else stopActionsRef.current.restartDaemon();
+    })
+      .then((u) => {
+        unlisten = u;
+      })
+      .catch(() => undefined);
+    return () => unlisten?.();
+  }, []);
+
   const value = useMemo<StoreValue>(
     () => ({
       loading,
@@ -1237,9 +1320,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       daemonPort,
       daemonVersion,
       daemonStarted,
+      daemonMode,
+      daemonHint,
+      liveSessionCount,
       client: clientRef.current,
       stopDaemon,
       restartDaemon,
+      requestStopDaemon,
+      pendingStopConfirm,
+      confirmStopDaemon,
+      cancelStopDaemon,
+      keepAlive,
+      setKeepAlive,
       createCard,
       moveCard,
       addProject,
@@ -1340,8 +1432,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       daemonPort,
       daemonVersion,
       daemonStarted,
+      daemonMode,
+      daemonHint,
+      liveSessionCount,
       stopDaemon,
       restartDaemon,
+      requestStopDaemon,
+      pendingStopConfirm,
+      confirmStopDaemon,
+      cancelStopDaemon,
+      keepAlive,
+      setKeepAlive,
       createCard,
       moveCard,
       addProject,
