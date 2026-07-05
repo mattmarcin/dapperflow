@@ -3150,6 +3150,57 @@ mod tests {
     use dflow_core::recipe::RecipeCatalog;
     use dflow_core::{DataDir, NewSession};
 
+    #[test]
+    fn standing_guidance_splices_claude_system_prompt_flag() {
+        // claude uses the append_system_prompt method, so the flag is spliced into argv
+        // right after the binary, carrying the standing guidance - no repo pollution.
+        let mut cmd = vec!["claude".to_string(), "--permission-mode".to_string(), "acceptEdits".to_string()];
+        let result = apply_standing_guidance("claude", &mut cmd);
+        assert!(matches!(result, GuidanceInjection::SystemPrompt));
+        assert_eq!(cmd[0], "claude");
+        assert_eq!(cmd[1], "--append-system-prompt");
+        assert_eq!(cmd[2], DFLOW_STANDING_GUIDANCE);
+        // The original flags are preserved after the injected pair.
+        assert!(cmd.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
+    }
+
+    #[test]
+    fn standing_guidance_fallback_is_a_first_prompt_preamble() {
+        // codex has no system-prompt flag, so the caller is handed the preamble to prepend
+        // to the first prompt (degraded, but never into the user's checkout). The argv is
+        // left untouched.
+        let mut cmd = vec!["codex".to_string()];
+        match apply_standing_guidance("codex", &mut cmd) {
+            GuidanceInjection::FirstPromptPreamble(text) => assert_eq!(text, DFLOW_STANDING_GUIDANCE),
+            _ => panic!("codex should hand back a first-prompt preamble"),
+        }
+        assert_eq!(cmd, vec!["codex".to_string()], "first_prompt fallback never edits argv");
+    }
+
+    #[test]
+    fn standing_guidance_none_for_unsupported_or_plain_shell() {
+        // cursor is flagged guidance-unsupported; a plain shell has no manifest. Both leave
+        // the argv untouched and inject nothing.
+        let mut cursor = vec!["cursor-agent".to_string()];
+        assert!(matches!(apply_standing_guidance("cursor", &mut cursor), GuidanceInjection::None));
+        assert_eq!(cursor, vec!["cursor-agent".to_string()]);
+        let mut shell = vec!["powershell".to_string()];
+        assert!(matches!(apply_standing_guidance("powershell", &mut shell), GuidanceInjection::None));
+    }
+
+    #[test]
+    fn standing_guidance_text_carries_the_contract_bullets() {
+        // The injected guidance must actually tell the agent when and how to use dflow
+        // (agent-cli.md / standing guidance content), so a New Session is self-explaining.
+        let g = DFLOW_STANDING_GUIDANCE;
+        assert!(g.contains("dflow know find"), "must say to consult memory first");
+        assert!(g.contains("dflow card create"), "must say to put work on the board");
+        assert!(g.contains("dflow status working"), "must say to self-report progress");
+        assert!(g.contains("dflow status blocked"), "must say to escalate when blocked");
+        assert!(g.contains("dflow status done"), "must say to report completion");
+        assert!(g.contains("dflow know add"), "must say to record durable learnings");
+    }
+
     /// A minimal in-memory `AppState` for handler unit tests (no listener, no PTYs).
     fn test_state() -> (AppState, tempdir_guard::TempDir) {
         let tmp = tempdir_guard::TempDir::new("dflowd-api");
