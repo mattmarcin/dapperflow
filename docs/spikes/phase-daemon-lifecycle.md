@@ -82,3 +82,92 @@ build. That OS behavior is build-dependent and was NOT reliable historically (he
 leaks), which is why the deterministic membership test - not the kill-and-observe test -
 is the mechanism's real guard. The reaping job makes reaping hold on every build,
 including the ones where console teardown misbehaves.
+
+## Deliverable 2 - dev vs prod ownership
+
+`apps/desktop/src-tauri/src/daemon.rs`. Startup resolution is identical in both modes:
+read the runtime file and, if it names a live daemon (pid alive AND the loopback socket
+answers), connect (`started = false`). Only when there is no live daemon do the modes
+diverge.
+
+- **Mode selection** (`daemon_mode`): `DFLOW_DEV_EXTERNAL_DAEMON` is the explicit override
+  (`1`/`true` -> dev-external, `0`/`false` -> prod-managed); unset defaults to dev-external
+  for a debug build and prod-managed for a release build.
+- **Production** (`prod-managed`): `ensure_managed_daemon` resolves the bundled daemon
+  (sidecar next to the app exe, or `DFLOWD_PATH`, or - only in a dev checkout - the
+  `target/` build), copies it into `%LOCALAPPDATA%/DapperFlow/bin/dflowd.exe` on first run
+  and whenever the bundled version differs (compared via `dflowd --version`, added for this
+  purpose), then spawns THAT copy fully detached (the existing `CREATE_BREAKAWAY_FROM_JOB` +
+  `DETACHED_PROCESS` flags). It never runs the compiler's `target/` output in a packaged
+  app, and never locks the file it may need to replace on update. A locked existing copy is
+  tolerated (kept, not fatal).
+- **Development** (`dev-external`): the app spawns NOTHING. If no daemon is live it returns
+  `{ connected: false, mode: "dev-external", hint }`, and the connection UI (`DaemonBanner`)
+  says to start the dev daemon (`just daemon-dev`) instead of spawning `target/debug`.
+  Rebuilds never fight an exe lock.
+
+The status bar distinguishes "attached" (connected to a running daemon) vs "started" (this
+run spawned it) and shows a `dev daemon` tag in dev-external mode; Settings > Daemon shows
+the full mode.
+
+### Production bundling (packaging step, deliberately not in the default config)
+
+The daemon must ship next to the app so `bundled_daemon_source` finds it. The Tauri
+mechanism is `externalBin`, which places the sidecar next to the app executable. It is NOT
+enabled in `tauri.conf.json` by default because Tauri validates it on every `cargo check`
+AND `tauri build` (verified: both fail with "resource path ... doesn't exist" when the
+sidecar is absent), which would break the standard dev/CI gates and the `--no-bundle`
+verify unless a staging step ran first. `scripts/stage-daemon-sidecar.{ps1,sh}` builds
+`dflowd` (release) and stages it as `binaries/dflowd-<triple>.exe`; a release pipeline runs
+that, enables `externalBin`, and runs `pnpm tauri build`. The runtime resolution/copy logic
+is complete and mode-agnostic; only the one-line config flip is left to the packager so the
+default gates stay green.
+
+## Deliverable 3 - dev control scripts
+
+Repo-root `justfile` (with `[windows]`/`[unix]` recipes) delegating to standalone
+`scripts/daemon-{dev,stop,status,restart}.{ps1,sh}` so the logic also works without `just`.
+`daemon-dev` runs `cargo watch -x 'run -p dflowd'` when cargo-watch is installed and falls
+back to a single `cargo run -p dflowd` with a note otherwise. Documented in CONTRIBUTING
+under "Running the daemon in development". These replace the ad-hoc `taskkill /F` + rebuild
+loop that caused the orphan leaks: every stop is a graceful `--stop`.
+
+## Deliverables 4 & 5 - system tray, graceful quit, settings
+
+`apps/desktop/src-tauri/src/{tray.rs,lib.rs}` plus the frontend store and Settings.
+
+- **Tray** (Tauri 2 `TrayIconBuilder`): always present. Menu: Open DapperFlow (show/focus,
+  or rebuild the window if it was closed), a live daemon status line (the frontend pushes
+  "running · N sessions" via `set_tray_status`), Stop daemon, Restart daemon, Quit. Left
+  click opens the window.
+- **Close-to-tray**: the window's `CloseRequested` is intercepted and the window hidden, so
+  closing the window never stops the daemon - the detached daemon and its agents keep
+  running and the tray stays in control.
+- **Graceful only**: tray Stop/Restart emit `tray://` events the frontend handles, reusing
+  its confirm-when-live dialog (mounted app-wide) and the graceful WebSocket shutdown. Quit
+  honors the keep-alive setting: ON leaves the daemon running; OFF sends a graceful
+  `--stop` first (`daemon::graceful_stop` shells `dflowd --stop`). The app NEVER force-kills
+  the daemon - force-kill stays safe only because of the reaping foundation, and is a human
+  last resort.
+- **Keep-alive setting** ("Keep agents running when I close the window", default ON):
+  persisted to `%LOCALAPPDATA%/DapperFlow/app-settings.json` via `get/set_keep_alive`,
+  surfaced as a toggle in Settings > Daemon alongside the mode, status, and Stop/Restart.
+
+## Verification
+
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: clean. Tauri app (a
+  separate workspace) clippy: clean.
+- `cargo test --workspace --lib --bins --locked`: 223 passed. `cargo test --workspace
+  --test '*' --locked -- --test-threads=1`: all pass (both reaping tests green). Note:
+  `dflow_everywhere` needs `target/debug/dflow.exe` present, so run the CI step `cargo build
+  --workspace --all-targets` first (an isolated `--bins` run does not emit the runnable
+  binary).
+- `pnpm build` (tsc + vite) and `pnpm tauri build --debug --no-bundle`: green.
+
+### Platform caveats
+
+Windows-first. `install_process_reaping_job`, the per-session `KillGuard`, `pid_alive`, and
+the detached-spawn flags are all `#[cfg(windows)]` with non-Windows stubs (reaping and
+pid-liveness are no-ops that trust the socket probe; spawn is a plain detached child). Unix
+process-group reaping (setsid + killpg / `PR_SET_PDEATHSIG`) lands when macOS and Linux
+enter CI at M1, per `architecture.md`.

@@ -8,6 +8,9 @@ target/
 node_modules/
 dist/
 
+# Staged Tauri sidecar binaries (produced by scripts/stage-daemon-sidecar.*)
+apps/desktop/src-tauri/binaries/
+
 # Local state and secrets
 *.local
 .env
