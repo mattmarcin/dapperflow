@@ -27,7 +27,7 @@ Defined in the `dflow-proto` crate; all types serde-serializable; protocol versi
 - `session.input` / `session.resize`: binary frames (above)
 - `session.send_verified { session_id, text, submit: true }` -> `{ submitted: bool, attempts }` (verified submit; see adapters.md)
 - `session.signal { session_id, action: interrupt|exit|kill }`
-- `session.resume { session_id }` -> relaunches the harness in the same worktree with its resume flag; response `{ new_session_id }`, lineage recorded via `resumed_from` (see architecture.md, session resume)
+- `session.resume { session_id }` -> relaunches the harness in the same worktree with its resume flag; response `{ session_id, resumed_from, resume_ref? }` where `session_id` is the NEW session and `resumed_from` records the predecessor's lineage (see architecture.md, session resume)
 - `session.rename { session_id, title }`
 - `agents.list {}` / `agents.detect {}` (PATH scan for known CLIs) / `agents.add { name, adapter, command, extra_args, extra_env }` / `agents.update` / `agents.remove`
 - `session.list {}` -> compact fleet table, including `interrupted` sessions with resumability info
@@ -35,7 +35,7 @@ Defined in the `dflow-proto` crate; all types serde-serializable; protocol versi
 ### project.*
 
 - `project.add { path }` -> validation (git repo, default branch detection) -> `{ project_id }`
-- `project.update { project_id, mode?, check_cmds?, default_recipe? }`
+- `project.update { project_id, mode?, check_cmds?, default_recipe?, rounds_schedule?, gardener_schedule? }` (absent fields unchanged; the schedule fields carry the round/gardener schedule json, `""` clears)
 - `project.list {}`
 
 ### card.*
@@ -70,13 +70,13 @@ Defined in the `dflow-proto` crate; all types serde-serializable; protocol versi
 
 ### github.*
 
-- `github.auth.start {}` / `github.auth.status {}` -> device-flow OAuth lifecycle
-- `github.issues.preview { project_id }` -> filtered issue list per the project's import config, without importing
-- `github.issues.import { project_id, numbers? }` -> creates/refreshes origin cards (dedupe on origin_ref); omitting numbers imports the configured filter set
+- `github.auth.status {}` -> reports the local `gh` CLI presence and auth: `{ present, authenticated, account?, host?, repo? }` (gh-first; DapperFlow shells out to `gh`, so there is no in-daemon OAuth device flow)
+- `github.issues.preview { project_id, filter }` -> `{ repo, issues: [{ number, title, labels, state, url, dedupe, existing_card_id? }] }`: the filtered issue list with a per-issue dedupe status, without importing
+- `github.issues.import { project_id, filter: { numbers?, assignee?, labels?, milestone?, state? }, dial_recipe? }` -> `{ repo, results: [{ number, title, card_id, outcome: created|refreshed|suppressed }] }`: creates/refreshes origin cards (dedupe on origin_ref). The curated selection nests under `filter.numbers`; an empty filter imports the configured filter set
 
 ### fleet.* and event.*
 
-- `fleet.status {}` -> one snapshot: sessions with lifecycle state, Needs You queue, active gate runs
+- `fleet.status {}` -> one snapshot: `{ sessions, needs_you }` (the session table with lifecycle state, and the open Needs You queue highest score first)
 - `event.subscribe { cursor? }` -> stream of `card_events` from cursor; the timeline UI, Needs You updates, and future sync all consume this
 - `event.ack { cursor }` for client bookmark persistence
 
