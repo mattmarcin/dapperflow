@@ -37,3 +37,12 @@ ghost_text_styles = ["dim"]
 [capabilities]
 mcp = true          # [L] opencode mcp add
 native_tier2 = "server SSE session.idle"
+
+[context_injection]
+# Standing dflow guidance for a New Session (adapters.md / Standing-guidance injection).
+# [L] VERIFIED-LOCAL 2026-07-05: `opencode --help` and `opencode run --help` (opencode
+# 1.17.13) expose no --system / --instructions flag - only --prompt. The `instructions`
+# array lives in the GLOBAL ~/.config/opencode/config.json, which would apply to every
+# opencode session, not this one - so it is not usable. Fall back to prepending the
+# guidance to the first prompt (degraded; non-polluting).
+method = "first_prompt"   # [L]

@@ -47,3 +47,12 @@ ghost_text_styles = ["dim"]   # argument-hint placeholder / suggestion is dim
 [capabilities]
 mcp = true          # [L] --mcp-config, claude mcp add, claude mcp serve
 native_tier2 = "Stop/Notification/SessionEnd hooks (HTTP or stream-json)"
+
+[context_injection]
+# Standing dflow guidance for a New Session (adapters.md / Standing-guidance injection).
+# [L] VERIFIED-LOCAL 2026-07-05 via `claude --help` (claude 2.1.x): --append-system-prompt
+# <prompt> "Append a system prompt to the default" and --system-prompt "System prompt to
+# use for the session" both exist for an interactive session. Session-scoped, non-polluting
+# (nothing written into the user's checkout), works with no brief. The preferred mechanism.
+method = "append_system_prompt"
+flag = ["--append-system-prompt", "{guidance}"]   # [L]

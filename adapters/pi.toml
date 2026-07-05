@@ -37,3 +37,13 @@ ghost_text_styles = ["dim"]
 [capabilities]
 mcp = false         # [D] pi intentionally ships no MCP; MCP recipes must fail validation
 native_tier2 = "none (event stream in --mode json only)"
+
+[context_injection]
+# Standing dflow guidance for a New Session (adapters.md / Standing-guidance injection).
+# [D] 2026-07-05: pi's only non-repo instructions channel is the GLOBAL per-user
+# ~/.pi/agent/APPEND_SYSTEM.md (highest precedence, applies to every pi session), so
+# writing it would leak the guidance globally and override the user's own config - not
+# usable. No session-scoped system-prompt flag exists. Fall back to prepending the
+# guidance to the first prompt (degraded; non-polluting). pi is not installed on this
+# machine, so this is docs-derived pending a live probe.
+method = "first_prompt"   # [D]
