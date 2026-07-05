@@ -102,6 +102,19 @@ Seed corrections learned in this audit (prior seed values re-verified against cu
 - opencode double-escape interrupt and background self-upgrade (`opencode upgrade`) remain hazards to probe live; the cleanest supervision channel is now the server SSE `session.idle` event, not the TUI.
 - pi trust prompt per path is CONFIRMED (saved to `~/.pi/agent/trust.json`, managed via `/trust`) and positional-arg brief is CONFIRMED (`pi "brief"`); new correction: pi intentionally ships no MCP, no sub-agents, and no permission popups, so an MCP-mounting recipe must fail validation on pi.
 
+## Standing-guidance injection (per harness)
+
+Every session must receive the dflow usage contract as ambient context (agent-cli.md), injected the least-intrusive way each harness allows, and **never** by writing into the user's project checkout (a New Session runs with `cwd` = the user's real repo root).
+
+Each adapter declares a `context_injection` method, resolved and verified per harness:
+
+- **System-prompt append** (preferred): a launch flag or session setting that appends standing text to the system prompt for that session only (e.g. Claude Code `--append-system-prompt`, verified in the adapter probe). No repo pollution, no first-prompt edit, works for New Session.
+- **Session settings file** (non-repo): a session-scoped config/instructions file passed by flag (the same mechanism the tier-2 hook `--settings` uses), living outside the worktree.
+- **Worktree file** (dispatch/round only): for sessions whose `cwd` is a disposable leased worktree, a guidance file (`AGENTS.md`-style) may be dropped in the worktree - never for New Session, whose cwd is the user's checkout.
+- **First-prompt fallback** (last resort): only if a harness offers no system-context mechanism, prepend a compact guidance preamble to the session's first message; documented as degraded.
+
+The exact mechanism per harness is verified in the adapter probe suite before trust; an adapter with no non-polluting mechanism is flagged so New Session on it launches without standing guidance rather than writing into the user's repo.
+
 ## Resume-ref capture (for daemon-restart session resume)
 
 The daemon must learn each session's harness-native id while the session runs, not at exit (a crash never reaches exit).

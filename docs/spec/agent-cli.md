@@ -1,10 +1,29 @@
 # Agent CLI Specification (`dflow`)
 
-The agent-side contract: a tiny cross-platform binary placed on PATH in every leased worktree.
-It is how worker agents (on any harness) report state, read their brief, run the plan-review loop, and file findings.
+The agent-side contract: a tiny cross-platform binary placed on PATH in **every** DapperFlow session.
+It is how worker agents (on any harness) report state, read their brief, maintain the board, run the plan-review loop, write knowledge, and file findings.
 Chosen over MCP for workers deliberately: a CLI works identically in every harness with zero mount configuration, and its output cost is fully under our control.
 
 Named `dflow`, not `df`, to avoid colliding with the Unix disk-free command.
+
+## Availability and standing guidance (all sessions, no manual instruction)
+
+The whole point of session-first is that any conversation keeps the board current as a side effect, so `dflow` must be present and self-explaining in **every** session, not only dispatched ones.
+
+- **Availability**: dispatch, Concertmaster rounds, AND plain New Session all inject `DFLOW_TOKEN` + `DFLOW_ENDPOINT` and prepend the `dflow` dir to the session PATH.
+  A card-originated session also gets `DFLOW_CARD`; a cardless New Session gets a **project-scoped** token (it may create cards, write knowledge, and self-report for its project, but owns no specific card until it creates one).
+- **Standing guidance, injected automatically**: every session receives the dflow usage contract through the harness's **system-prompt / ambient-context mechanism** (per adapters.md), never by editing the user's first prompt and never by writing a file into the user's project checkout.
+  The user must never have to tell an agent to use `dflow`; the agent knows when and how from the standing guidance.
+
+### The standing guidance content (when and how)
+
+The injected guidance instructs the agent, in short:
+
+- Before re-deriving any project fact, run `dflow know find <topic>` first.
+- When you begin real work on something, put it on the board: `dflow card create --title "..."` (or adopt the existing `dflow card` if one is set).
+- At meaningful boundaries, keep the board honest: `dflow status working "<short note>"` (the note shows on the board), `dflow status blocked "<the decision you need>"` when you need the human, `dflow status done` when finished.
+- When you learn something durable about the project (a decision, convention, gotcha, runbook step), record it: `dflow know add --type <t> --title "..."`.
+- Keep it lightweight: a card per real unit of work, not per message; a note for durable knowledge, not for chatter.
 
 ## Design rules (AXI principles, applied)
 
