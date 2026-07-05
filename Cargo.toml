@@ -33,7 +33,7 @@ axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 ulid = "1"
 base64 = "0.22"
-rand = "0.9"
+rand = "0.10"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 fs2 = "0.4"
