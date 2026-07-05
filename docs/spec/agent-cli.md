@@ -53,7 +53,7 @@ The injected guidance instructs the agent, in short:
 | `dflow card move [<id>] <lane>` | Move a card on the board | Recipe-gated lanes (verifying, pr, done) are arbitrated like `status done` |
 | `dflow know [find\|get\|add]` | Project knowledgebase verbs | See knowledge.md; autonomous writes, evidenced by `knowledge_updated` events |
 | `dflow plan open <file.html>` | Register a plan artifact for review | Idempotent per path; returns review URL for the human |
-| `dflow plan poll` | Bounded poll for human feedback | Blocks up to ~4 minutes (under harness tool timeouts), then returns feedback items, layout warnings, `pending` + re-poll guidance, or `ended` + `next_step`; safe to re-run forever, feedback is never lost |
+| `dflow plan poll` | Bounded foreground poll for human feedback | Blocks up to 100s (under the 120s default harness tool timeout), then returns feedback items, layout warnings, `pending` + re-poll guidance, or `ended` + `next_step`; safe to re-run forever, feedback is never lost; run in the foreground and re-run until `approved` |
 | `dflow finding add --severity <s> --body <text>` | File a finding (gate, scout reports) | |
 | `dflow help [verb]` | Concise per-verb reference | |
 
