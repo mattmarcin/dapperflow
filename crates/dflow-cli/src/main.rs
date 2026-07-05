@@ -495,11 +495,14 @@ shape, or scope. Every finding needs a concrete failure scenario, not vibes.
         .to_string(),
         Some("plan") => "\
 dflow plan open <file.html> [--title <t>]   register a self-contained plan artifact for review
-dflow plan poll                             bounded ~4min long-poll for the human's feedback batch
+dflow plan poll                             blocking long-poll for the human's feedback batch
 
-The loop: write a self-contained plan.html, `dflow plan open plan.html`, then loop on
-`dflow plan poll`. A poll returns queued feedback (revise in place and re-open), `pending`
-(re-poll), or `ended`/`approved` with a next step. Feedback is never lost.
+The loop (hold it in the FOREGROUND): write a self-contained plan.html, `dflow plan open
+plan.html`, then run `dflow plan poll` and wait - it blocks until the human sends feedback
+or approves. On feedback, revise in place and re-run `dflow plan open plan.html` (a new
+round), then poll again. On a timeout it returns with nothing queued: just poll again. Keep
+going until a poll returns `approved`; do not background the poll or end your session before
+then. Feedback is never lost.
 "
         .to_string(),
         Some("round") => "\

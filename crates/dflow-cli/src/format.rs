@@ -260,7 +260,10 @@ pub fn render_artifact_registered(res: &ArtifactRegistered) -> String {
     let verb = if res.revised { "revised" } else { "opened" };
     let mut out = format!("{verb} plan artifact {}  round:{}  status:{}\n", a.id, a.round, a.status);
     out.push_str(&format!("review: {}\n", res.review_hint));
-    out.push_str("next: run `dflow plan poll` to wait for the human's feedback\n");
+    out.push_str(
+        "next: run `dflow plan poll` now and keep it in the FOREGROUND - it blocks until the \
+         human responds; do not background it or end your session\n",
+    );
     out
 }
 

@@ -2,7 +2,7 @@
 //! pure, so these assert exact text without a daemon.
 
 use super::*;
-use dflow_proto::{KnowCatalogGroup, KnowNote, KnowNoteHit};
+use dflow_proto::{ArtifactMeta, KnowCatalogGroup, KnowNote, KnowNoteHit};
 
 fn card(id: &str, ctype: &str, title: &str, lane: &str) -> Card {
     Card {
@@ -243,6 +243,122 @@ fn know_add_created_vs_updated() {
     assert!(new.starts_with("recorded: gotchas/x (new)  gotchas/x.md\n"));
     let upd = render_know_add(&KnowAddResult { id: "gotchas/x".into(), path: "gotchas/x.md".into(), created: false });
     assert!(upd.starts_with("recorded: gotchas/x (updated)  gotchas/x.md\n"));
+}
+
+// ---- plan loop rendering (audit finding #4: the poll must drive the loop) ----
+
+fn artifact_meta(round: u32, status: &str, revised: bool) -> ArtifactMeta {
+    ArtifactMeta {
+        id: "01ART".into(),
+        card_id: "01CARD".into(),
+        kind: "plan".into(),
+        title: Some("Retry plan".into()),
+        doc_id: "01DOC".into(),
+        revised_doc_id: if revised { Some("01REV".into()) } else { None },
+        round,
+        status: status.into(),
+        created_at: 0,
+        updated_at: 0,
+    }
+}
+
+fn poll_result(round: u32, status: &str) -> FeedbackPollResult {
+    FeedbackPollResult {
+        artifact_id: "01ART".into(),
+        round,
+        items: Vec::new(),
+        layout_warnings: Vec::new(),
+        ended: false,
+        pending: false,
+        approved: false,
+        status: status.into(),
+        next_step: String::new(),
+    }
+}
+
+#[test]
+fn plan_open_points_at_a_foreground_blocking_poll() {
+    // `dflow plan open` must steer the agent into a foreground poll, not a fire-and-forget.
+    let res = ArtifactRegistered {
+        artifact: artifact_meta(1, "open", false),
+        revised: false,
+        review_hint: "open card 01CARD's Plan tab to review".into(),
+    };
+    let out = render_artifact_registered(&res);
+    assert!(out.starts_with("opened plan artifact 01ART  round:1  status:open\n"), "got: {out}");
+    let next = out.trim_end().lines().last().unwrap();
+    assert!(next.starts_with("next: "));
+    assert!(next.contains("FOREGROUND"), "the poll must be framed as foreground: {out}");
+    assert!(next.contains("do not background it"), "must warn against backgrounding: {out}");
+}
+
+#[test]
+fn plan_reopen_is_surfaced_as_a_revision() {
+    // Re-opening the same file is idempotent-and-round-bumping (store), and the CLI must
+    // show it as a revision on the bumped round, still pointing back at the poll.
+    let res = ArtifactRegistered {
+        artifact: artifact_meta(2, "open", true),
+        revised: true,
+        review_hint: "open card 01CARD's Plan tab to review".into(),
+    };
+    let out = render_artifact_registered(&res);
+    assert!(out.starts_with("revised plan artifact 01ART  round:2  status:open\n"), "got: {out}");
+    assert!(out.trim_end().lines().last().unwrap().contains("dflow plan poll"));
+}
+
+#[test]
+fn plan_poll_feedback_points_at_reopen_then_poll() {
+    // A delivered batch must tell the agent to revise, re-open (new round), and poll again.
+    let mut res = poll_result(3, "open");
+    res.items = vec![FeedbackItem {
+        kind: "chat".into(),
+        anchor: None,
+        body: Some("simplify section 4".into()),
+        question_key: None,
+        value: None,
+        diagram: None,
+        node: None,
+        action: None,
+        status: None,
+    }];
+    res.next_step =
+        "revise the artifact in place, then re-run `dflow plan open <file>` (this opens a new \
+         round) and `dflow plan poll` again in the foreground - the plan stage is not done until \
+         a poll returns `approved`"
+            .into();
+    let out = render_plan_poll(&res);
+    assert!(out.starts_with("feedback (1 item, round 3):\n"), "got: {out}");
+    assert!(out.contains("[chat] simplify section 4"));
+    let next = out.trim_end().lines().last().unwrap();
+    assert!(next.contains("dflow plan open"), "must name the re-open: {out}");
+    assert!(next.contains("dflow plan poll"), "must name the re-poll: {out}");
+}
+
+#[test]
+fn plan_poll_timeout_says_repoll_in_foreground() {
+    // On a bounded-poll timeout (nothing queued yet) the agent must be told, definitively,
+    // to run `dflow plan poll` again and not to end its session.
+    let mut res = poll_result(1, "awaiting_feedback");
+    res.pending = true;
+    res.next_step = "still waiting - the human has not sent feedback yet; run `dflow plan poll` \
+         again now, in the foreground, to keep holding the loop; do not end your session"
+        .into();
+    let out = render_plan_poll(&res);
+    assert!(out.starts_with("no feedback queued yet (round 1)\n"), "got: {out}");
+    let next = out.trim_end().lines().last().unwrap();
+    assert!(next.contains("dflow plan poll"), "the resume command must be named: {out}");
+    assert!(next.contains("do not end your session"), "must forbid ending the session: {out}");
+}
+
+#[test]
+fn plan_poll_approved_says_stop_and_proceed() {
+    let mut res = poll_result(2, "approved");
+    res.ended = true;
+    res.approved = true;
+    res.next_step = "plan approved; stop polling and proceed to implement in your main channel".into();
+    let out = render_plan_poll(&res);
+    assert!(out.starts_with("review approved (round 2)\n"), "got: {out}");
+    assert!(out.trim_end().lines().last().unwrap().contains("proceed to implement"));
 }
 
 #[test]
