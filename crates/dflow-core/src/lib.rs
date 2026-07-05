@@ -25,6 +25,7 @@ mod store;
 mod worktree;
 
 pub use env::{DriftEntry, EnvVault, EnvError, ImportReport, MaterializedEnv, VaultCrypto};
+pub use job::{install_process_reaping_job, reaping_job_console_host_pids};
 pub use github::{
     Gh, GhAuth, GhError, GhRunner, Issue, IssueFilters, MergeMethod, PrCreate, PrInfo, ProcessRunner,
     RepoInfo, RepoRef,

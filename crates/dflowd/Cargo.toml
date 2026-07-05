@@ -49,3 +49,12 @@ dflow-proto = { workspace = true }
 serde_json.workspace = true
 base64.workspace = true
 ulid.workspace = true
+
+# Process enumeration for the hard-kill reaping test (`tests/reaping.rs`): snapshot the
+# process table to find the daemon's ConPTY console-host descendants and prove they are
+# gone after an abrupt daemon kill. Test-only; not linked into the shipped daemon.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
