@@ -104,7 +104,13 @@ export interface TerminalBinding {
 export interface StoreValue {
   loading: boolean;
   error: string | null;
+  // The build-time dev-fixtures flag (VITE_DFLOW_FIXTURES). Prefer `dataMode` for any
+  // "is this demo data" UI decision; this stays for internal gating only.
   fixtureMode: boolean;
+  // The ACTUAL data source in use: "fixture" only for the dev fixture board, "live" for the
+  // real daemon AND the honest empty/disconnected board. UI demo indicators must key off
+  // this, so a down daemon never masquerades as a live fleet.
+  dataMode: DataSource["mode"];
 
   projects: Project[];
   cards: Card[];
@@ -276,6 +282,11 @@ const DEFAULT_ROWS = 30;
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const fixtureMode = usingFixtures();
+  // The ACTUAL data-source mode (fixture vs live), set once the source is created at boot.
+  // The fixture/demo indicator keys off THIS, not the build flag, so a down daemon on a
+  // real build (EmptyDataSource, mode "live") is never mislabeled as demo data - and dev
+  // fixtures always are. Initialized from the flag; corrected to the real source mode below.
+  const [dataMode, setDataMode] = useState<DataSource["mode"]>(fixtureMode ? "fixture" : "live");
   const sourceRef = useRef<DataSource | null>(null);
   const clientRef = useRef<DflowClient | null>(null);
   const bindingsRef = useRef<Map<string, TerminalBinding[]>>(new Map());
@@ -514,6 +525,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       if (cancelled) return;
       try {
         sourceRef.current = createDataSource(clientRef.current);
+        // Reflect the REAL source in the demo/fixture indicator: fixtures only when the dev
+        // flag forced them; a daemon-down real build is EmptyDataSource (mode "live"), not
+        // demo data, so nothing fabricated ever reads as live.
+        setDataMode(sourceRef.current.mode);
         await refresh();
         if (cancelled) return;
         // Configured launchers power the New Session picker and Settings > Agents;
@@ -1268,6 +1283,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       loading,
       error,
       fixtureMode,
+      dataMode,
       projects,
       cards,
       sessions,
@@ -1382,6 +1398,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       loading,
       error,
       fixtureMode,
+      dataMode,
       projects,
       cards,
       sessions,

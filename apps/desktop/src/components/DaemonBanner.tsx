@@ -12,7 +12,7 @@ import { useStore } from "../state/store";
 // blip does not flash), holds steady through the whole retry cycle, and clears
 // cleanly only once the daemon is truly connected again.
 export function DaemonBanner() {
-  const { daemon, fixtureMode, daemonMode, daemonHint } = useStore();
+  const { daemon, dataMode, daemonMode, daemonHint } = useStore();
   const [visible, setVisible] = useState(false);
   const graceTimer = useRef<number>();
 
@@ -68,8 +68,10 @@ export function DaemonBanner() {
         ) : offline ? (
           <>
             Daemon offline. Live terminals are unavailable
-            {fixtureMode ? "; the board is running on dev fixtures." : "."} Start{" "}
-            <code>dflowd</code> to open real sessions.
+            {dataMode === "fixture"
+              ? "; the board is running on dev fixtures (demo data, not live)."
+              : "; the board is empty until it connects."}{" "}
+            Start <code>dflowd</code> to open real sessions.
           </>
         ) : (
           <>Daemon unavailable. Reconnecting…</>
