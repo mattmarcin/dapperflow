@@ -390,6 +390,20 @@ impl Store {
         })
     }
 
+    /// Link a session row to a card (`agent-cli.md`: `dflow card create` sets a cardless
+    /// session's card going forward). Only ever fills an EMPTY `card_id` - the first card a
+    /// cardless New Session creates becomes its card, and later follow-up cards do not
+    /// steal it. Returns whether a row was newly linked. Idempotent: a session already
+    /// linked (to this or any card) is left unchanged and returns `false`.
+    pub fn set_session_card(&self, id: &str, card_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        let changed = conn.execute(
+            "UPDATE sessions SET card_id = ?2 WHERE id = ?1 AND card_id IS NULL",
+            params![id, card_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Set (or clear, on empty) a session's tab title. Returns whether a row matched.
     pub fn set_session_title(&self, id: &str, title: &str) -> Result<bool, StoreError> {
         let value: Option<&str> = if title.is_empty() { None } else { Some(title) };

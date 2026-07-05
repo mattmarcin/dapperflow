@@ -1341,15 +1341,23 @@ pub fn inject_agent_env(
 /// current card, session state/note, acceptance criteria, and the project digest from
 /// the token scope (`agent-cli.md` / Verbs).
 pub fn agent_context(state: &AppState, token: &AgentToken) -> Result<AgentContextResult, ProtocolError> {
-    let card = match &token.card_id {
+    let session_row = match token.session_id() {
+        Some(sid) => state.store.get_session(&sid).map_err(store_err)?,
+        None => None,
+    };
+    // The effective card: the token's dispatch card, else the card a cardless New Session
+    // adopted via `dflow card create` (persisted on its session row), so bare `dflow`
+    // shows the adopted card instead of "no card assigned" once work is on the board.
+    let effective_card_id = token
+        .card_id
+        .clone()
+        .or_else(|| session_row.as_ref().and_then(|r| r.card_id.clone()));
+    let card = match &effective_card_id {
         Some(cid) => state.store.get_card(cid).map_err(store_err)?,
         None => None,
     };
-    let (session_state, status_note) = match token.session_id() {
-        Some(sid) => match state.store.get_session(&sid).map_err(store_err)? {
-            Some(row) => (Some(row.state), row.status_note),
-            None => (None, None),
-        },
+    let (session_state, status_note) = match &session_row {
+        Some(row) => (Some(row.state.clone()), row.status_note.clone()),
         None => (None, None),
     };
     let acceptance = card
@@ -1601,6 +1609,16 @@ pub fn card_create_scoped(
         })
         .map_err(store_err)?;
     token.record_created_card(&card.id);
+    // A cardless New Session adopts its FIRST created card as the session's card, so the
+    // board shows the session under it and bare `dflow` / `dflow status` resolve to it
+    // going forward (`agent-cli.md`: `dflow card create` sets the session's card). Only
+    // fills an empty link (first card wins); a dispatched session has `card_id` set and is
+    // skipped, so its follow-up cards stay follow-ups.
+    if token.card_id.is_none() {
+        if let Some(session_id) = token.session_id() {
+            let _ = state.store.set_session_card(&session_id, &card.id);
+        }
+    }
     Ok(CardCreated { card_id: card.id.clone(), card, dedupe: Some("created".to_string()) })
 }
 
