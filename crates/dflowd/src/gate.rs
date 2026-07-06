@@ -958,6 +958,12 @@ fn spawn_gate_session(
     let session = state.sessions.create(spec).map_err(|e| format!("could not launch gate harness '{harness_name}': {e}"))?;
     token_handle.bind_session(&session.id.to_string());
 
+    // Watch for and answer a trust/permission dialog per the manifest, the same as dispatch
+    // (`adapters.md` dispatch flow step 7). A gate worktree is a fresh checkout, so a shim
+    // reviewer/fixer parks on a folder-trust prompt before it can ever become ready to receive
+    // its typed brief; without this the readiness gate below would time out on the dialog.
+    crate::api::spawn_trust_watcher(Arc::clone(&session), harness_name.to_string());
+
     // Typed delivery: type the full brief after launch via the shared readiness-gated
     // verified-submit path. A gate session that never received its brief would file no
     // findings and an empty review must never count as a pass, so a failed submit kills the
