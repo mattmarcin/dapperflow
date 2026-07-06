@@ -36,6 +36,16 @@ struct HarnessCase {
     extra_args: Vec<&'static str>,
 }
 
+/// A dispatch brief-delivery case: a harness plus the delivery mode it exercises.
+struct BriefCase {
+    name: &'static str,
+    adapter: &'static str,
+    command: &'static str,
+    model: Option<&'static str>,
+    extra_args: Vec<&'static str>,
+    mode: &'static str,
+}
+
 /// Dispatch one harness, attach, capture the live screen, and report. Returns the
 /// captured screen text (evidence). Panics only on a hard launch failure (e.g. os error
 /// 193 surfaced by the daemon), which is the regression this guards.
@@ -423,15 +433,14 @@ async fn live_dispatch_brief_below_the_fold() {
     // instruction (it appears nowhere in the brief text).
     let proof_token = "5555";
 
-    // (name, adapter, command, model, extra_args, delivery-mode label).
-    let cases: Vec<(&str, &str, &str, Option<&str>, Vec<&str>, &str)> = vec![
-        ("claude", "claude", "claude", Some("haiku"), vec!["--dangerously-skip-permissions"], "argv (control)"),
-        ("codex", "codex", "codex", None, vec![], "typed"),
-        ("opencode", "opencode", "opencode", Some("opencode-go/glm-5.2"), vec![], "typed"),
+    let cases = vec![
+        BriefCase { name: "claude", adapter: "claude", command: "claude", model: Some("haiku"), extra_args: vec!["--dangerously-skip-permissions"], mode: "argv (control)" },
+        BriefCase { name: "codex", adapter: "codex", command: "codex", model: None, extra_args: vec![], mode: "typed" },
+        BriefCase { name: "opencode", adapter: "opencode", command: "opencode", model: Some("opencode-go/glm-5.2"), extra_args: vec![], mode: "typed" },
     ];
 
     let mut results: Vec<(String, bool)> = Vec::new();
-    for (name, adapter, command, model, extra_args, mode) in &cases {
+    for BriefCase { name, adapter, command, model, extra_args, mode } in &cases {
         if !on_path(command) {
             eprintln!("SKIP [{name}]: {command} not on PATH");
             continue;
