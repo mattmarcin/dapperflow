@@ -1170,6 +1170,38 @@ const FIRST_PROMPT_READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// Needs You score for a first-prompt submit failure (an active blocked agent).
 const FIRST_PROMPT_FAIL_SCORE: i64 = 500;
 
+/// Deliver a composed brief to a live session by TYPED injection: wait (readiness-gated) for
+/// the composer, then verified-submit, returning whether the brief actually landed
+/// (`adapters.md` / Verified submit, Dispatch brief delivery).
+///
+/// Shared by the dispatch first-prompt path and the gate reviewer/fixer brief delivery so
+/// both use ONE readiness-gated verified-submit contract: a shim harness (whose multi-line
+/// launch-argument brief `cmd.exe` would truncate at the first newline) receives its whole
+/// brief this way instead of as a truncated launch argument. The caller decides what a
+/// `false` return means - dispatch raises Needs You, the gate fails/escalates the run - so a
+/// brief that never landed is never silently treated as delivered.
+pub fn deliver_typed_brief(session: &Session, prompt: &str) -> bool {
+    let manifest = match bundled_manifests().get(&session.harness) {
+        Some(m) => m,
+        None => {
+            tracing::warn!(harness = %session.harness, "no manifest; typed brief not submitted");
+            return false;
+        }
+    };
+    let cfg = SubmitConfig::from_manifest(manifest);
+    if !steer::wait_for_composer_ready(session, manifest, FIRST_PROMPT_READY_TIMEOUT) {
+        tracing::warn!(session_id = %session.id, "composer not ready; typed brief not submitted");
+        return false;
+    }
+    let outcome = steer::send_verified(session, manifest, prompt, &cfg);
+    if outcome.submitted {
+        tracing::info!(session_id = %session.id, attempts = outcome.attempts, "typed brief submitted");
+    } else {
+        tracing::warn!(session_id = %session.id, attempts = outcome.attempts, "typed brief verified submit failed");
+    }
+    outcome.submitted
+}
+
 /// Submit the New Session first prompt through verified submit once the composer is
 /// ready (`adapters.md` / Verified submit; Phase 2 first-prompt auto-submit).
 ///
@@ -1178,28 +1210,10 @@ const FIRST_PROMPT_FAIL_SCORE: i64 = 500;
 /// for a cardless one, so the message is never silently dropped.
 pub fn spawn_first_prompt_submit(state: &AppState, session: Arc<Session>, prompt: String) {
     let store = Arc::clone(&state.store);
-    let harness = session.harness.clone();
     let handle = std::thread::Builder::new()
         .name(format!("first-prompt-{}", session.id))
         .spawn(move || {
-            let manifest = match bundled_manifests().get(&harness) {
-                Some(m) => m,
-                None => {
-                    tracing::warn!(%harness, "no manifest; first prompt not auto-submitted");
-                    return;
-                }
-            };
-            let cfg = SubmitConfig::from_manifest(manifest);
-            if !steer::wait_for_composer_ready(&session, manifest, FIRST_PROMPT_READY_TIMEOUT) {
-                tracing::warn!(session_id = %session.id, "composer not ready; first prompt not submitted");
-                raise_first_prompt_failure(&store, &session);
-                return;
-            }
-            let outcome = steer::send_verified(&session, manifest, &prompt, &cfg);
-            if outcome.submitted {
-                tracing::info!(session_id = %session.id, attempts = outcome.attempts, "first prompt submitted");
-            } else {
-                tracing::warn!(session_id = %session.id, attempts = outcome.attempts, "first prompt verified submit failed");
+            if !deliver_typed_brief(&session, &prompt) {
                 raise_first_prompt_failure(&store, &session);
             }
         });
