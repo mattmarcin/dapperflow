@@ -377,3 +377,152 @@ async fn live_four_harness_launch_and_first_prompt() {
     eprintln!("\n==== LAUNCHED WITHOUT os error 193: {launched:?} ====");
     assert!(!launched.is_empty(), "no harness CLIs were available to test");
 }
+
+/// LIVE dispatch brief-delivery acceptance (`adapters.md` / Dispatch brief delivery). For
+/// each harness, `dispatch.start` a REAL card whose acceptance criteria sit BELOW the first
+/// newline and require the agent to COMPUTE a value: "reply with the word quokka and the sum
+/// of 1234 and 4321". The airtight proof the full brief was delivered (not truncated to the
+/// card title) is the agent replying with 5555 - a value that appears NOWHERE in the brief
+/// text, so it can only be produced by reading and acting on the below-the-fold instruction.
+///
+/// codex and opencode (glm-5.2) exercise the fixed TYPED delivery (shim launch via
+/// `cmd.exe /c`); claude (haiku) is the CONTROL for the unchanged native-exe argv path.
+/// Runs are kept short and each session is killed by its own id.
+///
+///   cargo build -p dflow-cli
+///   cargo test -p dflowd --test live_harness_io -- --ignored --nocapture \
+///       live_dispatch_brief_below_the_fold
+#[tokio::test]
+#[ignore = "live: dispatches real codex/opencode/claude sessions (spends a little)"]
+async fn live_dispatch_brief_below_the_fold() {
+    let data_dir = unique_data_dir("live-brief-fold");
+    let (_guard, port, token) = start_daemon(&data_dir, &[("DFLOW_LOG", "info")]);
+    let mut ws = connect_and_auth(port, &token).await;
+    let mut sink = Vec::new();
+
+    let repo = scratch_repo(&data_dir);
+    let padd = request(
+        &mut ws,
+        &Envelope::message("p", "project.add", json!({ "path": repo.to_string_lossy() })),
+        &mut sink,
+    )
+    .await;
+    let project_id = padd.payload["project_id"].as_str().unwrap().to_string();
+
+    // The card brief. Line 1 (the card title) is all a truncated launch-argument brief would
+    // deliver; the acceptance criteria - which require COMPUTING 1234 + 4321 = 5555 - live
+    // several lines below the first newline. 5555 appears nowhere in the brief, so the agent
+    // can only produce it by reading and acting on the below-the-fold instruction.
+    let card_brief = "DELIVERY SELF-TEST - this card verifies your dispatched brief arrived complete.\n\n\
+         ## Acceptance criteria\n\
+         1. Your FIRST and ONLY action: reply with the word quokka followed by the sum of 1234 and 4321.\n\
+         2. Then stop. Do NOT edit files. Do NOT run any tools or commands.\n\n\
+         This acceptance section sits BELOW the first newline of your brief; the sum it asks for \
+         is proof you received the whole brief, not just the card title.";
+    // The computed answer - present ONLY if the agent read and acted on the below-the-fold
+    // instruction (it appears nowhere in the brief text).
+    let proof_token = "5555";
+
+    // (name, adapter, command, model, extra_args, delivery-mode label).
+    let cases: Vec<(&str, &str, &str, Option<&str>, Vec<&str>, &str)> = vec![
+        ("claude", "claude", "claude", Some("haiku"), vec!["--dangerously-skip-permissions"], "argv (control)"),
+        ("codex", "codex", "codex", None, vec![], "typed"),
+        ("opencode", "opencode", "opencode", Some("opencode-go/glm-5.2"), vec![], "typed"),
+    ];
+
+    let mut results: Vec<(String, bool)> = Vec::new();
+    for (name, adapter, command, model, extra_args, mode) in &cases {
+        if !on_path(command) {
+            eprintln!("SKIP [{name}]: {command} not on PATH");
+            continue;
+        }
+        let _ = request(
+            &mut ws,
+            &Envelope::message(
+                "ag",
+                "agents.add",
+                json!({ "name": format!("{name}-bd"), "adapter": adapter, "command": command, "extra_args": extra_args }),
+            ),
+            &mut sink,
+        )
+        .await;
+
+        let cadd = request(
+            &mut ws,
+            &Envelope::message(
+                "c",
+                "card.create",
+                json!({
+                    "title": format!("{name} brief-delivery proof"),
+                    "type": "chore",
+                    "project_id": project_id,
+                    "brief": card_brief,
+                }),
+            ),
+            &mut sink,
+        )
+        .await;
+        let card_id = cadd.payload["card_id"].as_str().expect("card_id").to_string();
+        let _ = request(
+            &mut ws,
+            &Envelope::message("mv", "card.move", json!({ "card_id": card_id, "column": "performing" })),
+            &mut sink,
+        )
+        .await;
+
+        let mut disp = json!({ "card_id": card_id, "agent": format!("{name}-bd") });
+        if let Some(m) = model {
+            disp["model"] = json!(m);
+        }
+        let started = request(&mut ws, &Envelope::message("d", "dispatch.start", disp), &mut sink).await;
+        let session_id = match started.payload["session_id"].as_str() {
+            Some(s) => s.to_string(),
+            None => {
+                eprintln!("[{name}] dispatch failed: {}", started.payload);
+                continue;
+            }
+        };
+        eprintln!("\n######## [{name}] dispatched session {session_id} (delivery: {mode}) ########");
+        let _ = request(
+            &mut ws,
+            &Envelope::message("at", "session.attach", json!({ "session_id": session_id, "cols": 120, "rows": 40 })),
+            &mut sink,
+        )
+        .await;
+
+        // Poll the live screen for the computed proof token (5555) for up to ~70s. It is not
+        // in the brief text, so seeing it means the agent read the below-the-fold sum and
+        // answered it - proof the whole brief was delivered AND acted on.
+        let mut seen = false;
+        let mut last = String::new();
+        for _ in 0..14 {
+            let stream = collect_output_until(&mut ws, proof_token, Duration::from_secs(5)).await;
+            let peek = request(
+                &mut ws,
+                &Envelope::message("pk", "session.peek", json!({ "session_id": session_id, "lines": 40 })),
+                &mut sink,
+            )
+            .await;
+            last = peek.payload["text"].as_str().unwrap_or("").to_string();
+            if stream.contains(proof_token) || last.contains(proof_token) {
+                seen = true;
+                break;
+            }
+        }
+        eprintln!("---- [{name}] settled screen ----\n{}\n---- end [{name}] ----", tail(&last, 26));
+        eprintln!("[{name}] BELOW-THE-FOLD SUM (5555) ACTED ON: {seen}");
+        results.push((format!("{name} [{mode}]"), seen));
+
+        let _ = request(&mut ws, &Envelope::message("k", "session.kill", json!({ "session_id": session_id })), &mut sink).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
+    eprintln!("\n==== DISPATCH BRIEF DELIVERY RESULTS ====");
+    for (label, seen) in &results {
+        eprintln!("  {label}: below-the-fold sum (5555) acted on = {seen}");
+    }
+    assert!(!results.is_empty(), "no harness CLIs were available to test");
+    for (label, seen) in &results {
+        assert!(seen, "[{label}] agent never produced the below-the-fold computed answer (5555)");
+    }
+}
