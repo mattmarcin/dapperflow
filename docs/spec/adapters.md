@@ -23,6 +23,9 @@ autonomy_flags = ["--permission-mode", "acceptEdits"]
 model_flag = ["--model", "{model}"]
 effort_flag = ["--effort", "{effort}"]        # accepted set probed, not assumed
 env = { CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION = "false" }
+brief_delivery = "argv"                       # argv | typed | auto (default): how the composed
+                                              # brief reaches the agent (see Dispatch flow). A
+                                              # native exe takes argv; a cmd.exe shim takes typed.
 
 [signals]
 busy_signature = "esc to interrupt"           # screen heuristic (tier 3)
@@ -161,11 +164,32 @@ Capture mechanism per harness, researched 2026-07-04:
 4. Start declared per-worktree services; port broker allocates and stages port env vars; a failed required service parks the card in Needs You instead of launching the agent.
 5. Stage `dflow` onto PATH with the per-task scoped token env.
 6. Compose brief: card brief + acceptance criteria + project memory digest + recipe stage guidance + `dflow` usage contract.
-7. Launch per manifest; watch for trust dialogs within the first N seconds and answer per manifest; confirm the brief started processing.
-8. Supervision loop consumes signals; state transitions append `card_events` and update Needs You.
+7. Decide brief delivery (argv vs typed, see below); an argv harness launches with the brief on its launch argument, a typed harness launches with NO brief in argv.
+8. Launch per manifest; watch for trust dialogs within the first N seconds and answer per manifest; for a typed harness, deliver the brief by readiness-gated verified submit and confirm it landed (a failed submit raises Needs You); confirm the brief started processing.
+9. Supervision loop consumes signals; state transitions append `card_events` and update Needs You.
 
-Known constraint (discovered in the finding #2/#3 audit, `docs/spikes/fix-harness-io.md`): dispatch delivers the composed brief as the `{prompt}` launch argument, but on Windows a shim-launched harness (codex/opencode/pi via `cmd.exe /c`) truncates a multi-line argument at the first newline, so only the brief's first line (the card title) reaches the agent.
-The robust fix is to deliver the dispatch brief for shim harnesses via the same readiness-gated typed path used for the New-Session first prompt (finding #3), rather than a truncated launch argument; native-exe harnesses (claude) are unaffected.
+### Brief delivery: argv for a native exe, typed for a shim (`docs/spikes/fix-brief-delivery.md`)
+
+The composed brief reaches the agent one of two ways, decided once per dispatch by
+`harness::brief_delivery(manifest, command)`:
+
+- **argv** - the brief rides in as the `{prompt}` launch argument.
+  Safe only for a native executable, whose launch does not pass through `cmd.exe`.
+  claude ships `claude.exe`, so its brief - even multi-line - arrives intact on the launch argument; this is proven and unchanged.
+- **typed** - the brief is delivered by TYPED injection AFTER launch, via the same readiness-gated verified-submit path New-Session first prompts use (finding #3).
+  This is required for a shim harness (codex/opencode/pi install a `*.cmd`), which launches through `cmd.exe /c` (finding #2): `cmd.exe` truncates any multi-line argument at the first newline, so a launch-argument brief would arrive as only the card title, and the agent would never see its acceptance criteria, the recipe protocol, or the dflow contract.
+  For a typed harness the launch is resolved with NO argv prompt (so nothing multi-line is handed to `cmd.exe`), and the full composed brief is typed once the composer is ready.
+  A failed submit raises Needs You rather than leaving a briefless agent running.
+
+The mode is manifest data (`adapter.brief_delivery = "argv" | "typed" | "auto"`).
+claude declares `argv`; codex/opencode/pi declare `typed`.
+The `auto` default (used by an unspecified or custom manifest) decides from the resolved launchable form, reusing the finding #2 `agents::launchable_command` signal: a launch that resolves through `cmd.exe` is typed, a native executable is argv.
+An unmanifested custom/stub launcher has no verified-submit path, so it keeps argv.
+
+Live proof (2026-07-05, `docs/spikes/fix-brief-delivery.md`): a real card whose acceptance criteria sat below the first newline (compute 1234 + 4321) was dispatched on each harness; codex and opencode (glm-5.2, both typed) and claude (haiku, argv control) each replied with 5555 - a value absent from the brief text, so producible only by reading the whole brief.
+
+One limitation, shared with the New-Session typed path: ConPTY drops a lone LF on the input channel, so typed injection normalizes the inter-line newlines (all CONTENT is delivered; the whitespace between lines is collapsed).
+This is a delivery-fidelity trait of keystroke injection, not truncation - no content is lost past the first newline, which is the bug that was fixed.
 
 ## Steering and recovery
 
