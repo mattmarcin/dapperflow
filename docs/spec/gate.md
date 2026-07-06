@@ -16,6 +16,14 @@ Runs in an isolated worktree leased from the project's pool under the `gate` lea
 Recipe knobs: `gate: full | checks_only | none`, reviewer harness, autofix aggressiveness.
 Project modes: `pr` (default) or `local_only` (gate ends with an approved local fast-forward merge instead of a push).
 
+## Session brief delivery
+
+The reviewer and fixer are gate sessions launched on their target harness, and their composed brief follows the adapter brief-delivery contract (`adapters.md` / Dispatch brief delivery) - the same decision the dispatch path uses.
+A native-exe harness (claude, the default gate harness) receives the brief as its launch argument.
+A shim harness (codex/opencode installs as a `*.cmd` shim launched through `cmd.exe /c`) would have its multi-line launch argument truncated at the first newline, so its brief is delivered by typed injection after launch instead - the reviewer's diff, acceptance criteria, and `dflow finding add` contract, and the fixer's findings list, all sit below that first line.
+Because the gate REQUIRES the reviewer harness to differ from the author's, the default cross-model pairing (claude author -> codex/opencode reviewer) puts the reviewer on a shim harness, so typed delivery is the normal reviewer path, not an edge case.
+A gate session whose typed brief delivery fails does not review blind: the run fails with reason `reviewer brief delivery failed` (or `fixer brief delivery failed`) and escalates to the human, rather than letting a briefless, finding-less reviewer count as a silent pass.
+
 ## Autofix earned claim
 
 A mechanical finding may be marked `autofixed` only when ALL of the following hold; a green re-check alone is never sufficient.

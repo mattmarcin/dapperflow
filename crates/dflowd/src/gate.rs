@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 use dflow_core::github::{Gh, MergeMethod, PrCreate};
 use dflow_core::recipe::{GateStrictness, ShipTarget, Stage};
 use dflow_core::{
-    category, gate_status, gate_step, harness, resolution, severity, FindingRow, GateRunRow,
-    NewGateRun, Recipe, SessionSpec,
+    bundled_manifests, category, gate_status, gate_step, harness, resolution, severity, FindingRow,
+    GateRunRow, NewGateRun, Recipe, SessionSpec,
 };
 use dflow_proto::{
     FindingAdd, FindingAddResult, FindingInfo, FindingResult, GateMerge, GateMergeResult,
@@ -33,7 +33,7 @@ use dflow_proto::{
 };
 use ulid::Ulid;
 
-use crate::api::{inject_agent_env, needs_input_score, store_err};
+use crate::api::{deliver_typed_brief, inject_agent_env, needs_input_score, store_err};
 use crate::server::AppState;
 use crate::tokens::TokenScope;
 
@@ -585,7 +585,32 @@ fn run_review(
     state.store.set_gate_run_step(&ctx.gate_run_id, gate_step::REVIEW).map_err(|e| e.to_string())?;
     let diff = git_capture(cwd, &["diff", &format!("{}...HEAD", ctx.project.default_branch)]).unwrap_or_default();
     let brief = compose_reviewer_brief(ctx, &diff);
-    let sid = spawn_gate_session(state, &ctx.reviewer_harness, &brief, cwd, ctx, env, worktree_id)?;
+    let sid = match spawn_gate_session(
+        state,
+        GateSessionReq { harness: &ctx.reviewer_harness, role: "reviewer", brief: &brief },
+        cwd,
+        ctx,
+        env,
+        worktree_id,
+    ) {
+        Ok(sid) => sid,
+        Err(reason) => {
+            // The reviewer never received its brief. Record the honest failure and abort the
+            // run: a briefless reviewer files no findings, and an empty review must never count
+            // as a pass (`gate.md` / Adversarial review; the adapter brief-delivery contract).
+            state
+                .store
+                .record_gate_step(
+                    &ctx.card_id,
+                    &ctx.gate_run_id,
+                    gate_step::REVIEW,
+                    "failed",
+                    serde_json::json!({ "reviewer_harness": ctx.reviewer_harness, "reason": reason }),
+                )
+                .map_err(|e| e.to_string())?;
+            return Err(reason);
+        }
+    };
     let finished = wait_for_session_exit(state, &sid, session_timeout());
     let findings = state.store.findings_for_run(&ctx.gate_run_id).map_err(|e| e.to_string())?;
     state
@@ -645,7 +670,14 @@ fn run_autofix(
     let before_head = git_head_sha(cwd);
     let before_status = git_status_porcelain(cwd);
 
-    let sid = spawn_gate_session(state, &fixer_harness, &brief, cwd, ctx, env, worktree_id)?;
+    let sid = spawn_gate_session(
+        state,
+        GateSessionReq { harness: &fixer_harness, role: "fixer", brief: &brief },
+        cwd,
+        ctx,
+        env,
+        worktree_id,
+    )?;
     let finished = wait_for_session_exit(state, &sid, session_timeout());
 
     // Grab the fixer's tail output for evidence before the session is reaped; scrubbed.
@@ -849,25 +881,51 @@ fn no_change_reason(finished: bool) -> &'static str {
 
 // ---- session spawning ----
 
+/// The identity of one gate session: the target harness, its pipeline `role`
+/// ("reviewer"/"fixer" - names the honest reason when its brief delivery fails), and the
+/// composed brief to deliver.
+struct GateSessionReq<'a> {
+    harness: &'a str,
+    role: &'a str,
+    brief: &'a str,
+}
+
 /// Spawn a gate reviewer/fixer session: mint a per-task token carrying the gate run id,
-/// inject the `dflow` CLI env, launch the harness in the gate worktree, and return the
-/// session id. Reuses the `DFLOW_LAUNCH_<HARNESS>` seam, so tests substitute a stub.
+/// inject the `dflow` CLI env, launch the harness in the gate worktree, deliver the brief,
+/// and return the session id. Reuses the `DFLOW_LAUNCH_<HARNESS>` seam, so tests substitute
+/// a stub.
+///
+/// The brief is delivered through the SAME decision point dispatch uses (`adapters.md` /
+/// Dispatch brief delivery): a native-exe harness (claude, the default gate harness) takes
+/// the brief as its `{prompt}` launch argument; a shim harness (codex/opencode - the default
+/// reviewer once "reviewer != author" forces a cross-harness pairing) launches through
+/// `cmd.exe /c`, which truncates a multi-line argument at the first newline, so its brief is
+/// TYPED after launch instead. This closes the gate sibling of the dispatch brief-truncation
+/// bug. `role` ("reviewer"/"fixer") names the honest failure reason when typed delivery fails
+/// - a gate session that never received its brief must never silently pass as an empty review.
 fn spawn_gate_session(
     state: &AppState,
-    harness_name: &str,
-    brief: &str,
+    req: GateSessionReq<'_>,
     cwd: &Path,
     ctx: &PipelineCtx,
     base_env: &BTreeMap<String, String>,
     worktree_id: &str,
 ) -> Result<String, String> {
-    // NOTE: the gate fixer/reviewer brief still rides in as a launch argument. On a shim
-    // harness this has the same `cmd.exe` multi-line truncation exposure as the dispatch
-    // brief did; the gate harness is claude by default (native exe, unaffected). Routing the
-    // gate brief through the typed-delivery path (`harness::brief_delivery`) is a tracked
-    // sibling follow-up, out of scope for the dispatch-brief-delivery fix.
-    let command = harness::harness_command(harness_name, Some(brief), None, None)
+    let GateSessionReq { harness: harness_name, role, brief } = req;
+    let manifest = bundled_manifests().get(harness_name);
+    // Resolve the launch WITH the brief to read its launchable form, then pick delivery.
+    let argv = harness::harness_command(harness_name, Some(brief), None, None)
         .ok_or_else(|| format!("harness '{harness_name}' is not launchable (no manifest or DFLOW_LAUNCH override)"))?;
+    let (command, typed_brief) = match harness::brief_delivery(manifest, &argv) {
+        harness::BriefDelivery::Argv => (argv, None),
+        // Re-resolve with no argv prompt so nothing multi-line reaches `cmd.exe`; the full
+        // brief is typed after the session is live (below).
+        harness::BriefDelivery::Typed => {
+            let bare = harness::harness_command(harness_name, None, None, None)
+                .ok_or_else(|| format!("harness '{harness_name}' is not launchable (no manifest or DFLOW_LAUNCH override)"))?;
+            (bare, Some(brief.to_string()))
+        }
+    };
 
     let (task_token, token_handle) = state.tokens.mint(TokenScope {
         card_id: Some(ctx.card_id.clone()),
@@ -899,6 +957,23 @@ fn spawn_gate_session(
     };
     let session = state.sessions.create(spec).map_err(|e| format!("could not launch gate harness '{harness_name}': {e}"))?;
     token_handle.bind_session(&session.id.to_string());
+
+    // Watch for and answer a trust/permission dialog per the manifest, the same as dispatch
+    // (`adapters.md` dispatch flow step 7). A gate worktree is a fresh checkout, so a shim
+    // reviewer/fixer parks on a folder-trust prompt before it can ever become ready to receive
+    // its typed brief; without this the readiness gate below would time out on the dialog.
+    crate::api::spawn_trust_watcher(Arc::clone(&session), harness_name.to_string());
+
+    // Typed delivery: type the full brief after launch via the shared readiness-gated
+    // verified-submit path. A gate session that never received its brief would file no
+    // findings and an empty review must never count as a pass, so a failed submit kills the
+    // briefless session and errors - the caller escalates/fails the run honestly.
+    if let Some(brief) = typed_brief {
+        if !deliver_typed_brief(&session, &brief) {
+            session.kill();
+            return Err(format!("{role} brief delivery failed"));
+        }
+    }
     Ok(session.id.to_string())
 }
 
