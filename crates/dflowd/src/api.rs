@@ -264,7 +264,7 @@ fn resolve_launch(
     harness_name: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
-    brief: &str,
+    prompt: Option<&str>,
 ) -> Result<ResolvedLaunch, ProtocolError> {
     if let Some(agent_ref) = agent_ref.map(str::trim).filter(|s| !s.is_empty()) {
         let agent = state
@@ -278,7 +278,7 @@ fn resolve_launch(
                 agent.name
             )));
         }
-        return Ok(launch_from_agent(agent, brief, model, effort));
+        return Ok(launch_from_agent(agent, prompt, model, effort));
     }
 
     let name = harness_name
@@ -287,9 +287,9 @@ fn resolve_launch(
         .unwrap_or(harness::DEFAULT_HARNESS)
         .to_string();
     match state.store.get_agent_by_name(&name).map_err(store_err)? {
-        Some(agent) if agent.enabled => Ok(launch_from_agent(agent, brief, model, effort)),
+        Some(agent) if agent.enabled => Ok(launch_from_agent(agent, prompt, model, effort)),
         _ => {
-            let command = harness::harness_command(&name, brief, model, effort).ok_or_else(|| {
+            let command = harness::harness_command(&name, prompt, model, effort).ok_or_else(|| {
                 ProtocolError::bad_request(format!(
                     "unknown harness '{name}' (built-ins: claude, codex, opencode; or add a launcher)"
                 ))
@@ -310,7 +310,7 @@ fn resolve_launch(
 /// (`product.md` / Settings > Agents).
 fn launch_from_agent(
     agent: dflow_proto::Agent,
-    brief: &str,
+    prompt: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> ResolvedLaunch {
@@ -318,7 +318,7 @@ fn launch_from_agent(
         &agent.name,
         &agent.adapter,
         &agent.command,
-        brief,
+        prompt,
         &agent.extra_args,
         model,
         effort,
@@ -382,8 +382,33 @@ pub fn dispatch_start(state: &AppState, req: DispatchStart) -> Result<DispatchSt
         harness_param.as_deref(),
         model.as_deref(),
         effort.as_deref(),
-        &brief,
+        Some(brief.as_str()),
     )?;
+
+    // Decide how the composed brief reaches the agent (`adapters.md` / Dispatch brief
+    // delivery). A native-exe harness (claude) takes the brief as its launch argument, which
+    // is proven; a shim harness (codex/opencode/pi) launches through `cmd.exe /c`, and
+    // `cmd.exe` truncates a multi-line argument at the first newline (finding #2), so its
+    // multi-line brief must be TYPED after launch via the readiness-gated verified-submit
+    // path (finding #3) instead of arriving as only the card title. The decision reuses the
+    // resolved launchable form (argv[0] is brief-independent, so this is stable).
+    let delivery = harness::brief_delivery(bundled_manifests().get(&launch.harness), &launch.command);
+    let (launch, typed_brief) = match delivery {
+        harness::BriefDelivery::Argv => (launch, None),
+        harness::BriefDelivery::Typed => {
+            // Re-resolve with no argv prompt so nothing multi-line is handed to `cmd.exe`;
+            // the full brief is typed after the session is live (below).
+            let bare = resolve_launch(
+                state,
+                agent_param,
+                harness_param.as_deref(),
+                model.as_deref(),
+                effort.as_deref(),
+                None,
+            )?;
+            (bare, Some(brief.clone()))
+        }
+    };
 
     // Recipe x harness compatibility: an MCP-mounting recipe on a harness without
     // verified MCP support fails at dispatch, not mid-run (`recipes.md`). The mounts
@@ -635,6 +660,16 @@ pub fn dispatch_start(state: &AppState, req: DispatchStart) -> Result<DispatchSt
     }
     // Watch for and answer a trust dialog per the manifest (dispatch flow step 7).
     spawn_trust_watcher(Arc::clone(&session), launch.harness.clone());
+
+    // Shim harnesses (typed delivery): the composed brief was kept out of argv above, so
+    // deliver it now by TYPED injection once the composer is ready - the same readiness-gated
+    // verified-submit path New-Session first prompts use (`adapters.md` / Dispatch brief
+    // delivery; finding #3). A failed submit raises Needs You rather than leaving a briefless
+    // agent running (`spawn_first_prompt_submit`). Native-exe harnesses already have the full
+    // brief on their launch argument, so `typed_brief` is `None` there.
+    if let Some(brief) = typed_brief {
+        spawn_first_prompt_submit(state, Arc::clone(&session), brief);
+    }
 
     let (worktree_id, worktree_path) = match worktree_row {
         Some(wt) => (wt.id, wt.path),
@@ -2551,7 +2586,9 @@ pub fn start_round(
         // the New Session front door), uniform across a real harness, the default shell,
         // and the `DFLOW_LAUNCH_<H>` test stub. An empty brief here keeps it out of argv.
         let h = harness_ref.unwrap_or("powershell");
-        let command = harness::harness_command(h, "", None, None)
+        // No brief in argv: the round brief is delivered via first_prompt (typed) below,
+        // exactly like the New Session front door.
+        let command = harness::harness_command(h, None, None, None)
             .or_else(|| default_command(h))
             .filter(|c| !c.is_empty())
             .ok_or_else(|| {

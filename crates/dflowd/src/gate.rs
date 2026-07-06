@@ -861,7 +861,12 @@ fn spawn_gate_session(
     base_env: &BTreeMap<String, String>,
     worktree_id: &str,
 ) -> Result<String, String> {
-    let command = harness::harness_command(harness_name, brief, None, None)
+    // NOTE: the gate fixer/reviewer brief still rides in as a launch argument. On a shim
+    // harness this has the same `cmd.exe` multi-line truncation exposure as the dispatch
+    // brief did; the gate harness is claude by default (native exe, unaffected). Routing the
+    // gate brief through the typed-delivery path (`harness::brief_delivery`) is a tracked
+    // sibling follow-up, out of scope for the dispatch-brief-delivery fix.
+    let command = harness::harness_command(harness_name, Some(brief), None, None)
         .ok_or_else(|| format!("harness '{harness_name}' is not launchable (no manifest or DFLOW_LAUNCH override)"))?;
 
     let (task_token, token_handle) = state.tokens.mint(TokenScope {

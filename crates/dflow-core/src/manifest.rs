@@ -58,6 +58,20 @@ pub struct AdapterSection {
     /// explanation rather than attempted blind (`adapters.md` / Verified submit).
     #[serde(default)]
     pub no_auto_steer: bool,
+    /// How the composed dispatch brief reaches the agent (`adapters.md` / Dispatch brief
+    /// delivery; audit finding on shim truncation). One of:
+    /// - [`BRIEF_DELIVERY_ARGV`]: the brief rides in as the `{prompt}` launch argument.
+    ///   Safe only for a native executable, whose launch does not pass through `cmd.exe`
+    ///   (e.g. `claude.exe`); proven for claude.
+    /// - [`BRIEF_DELIVERY_TYPED`]: the brief is TYPED after launch via the readiness-gated
+    ///   verified-submit path (finding #3). Required for a shim harness (codex/opencode/pi),
+    ///   which launches through `cmd.exe /c` - and `cmd.exe` truncates a multi-line argument
+    ///   at the first newline, so a launch-argument brief would arrive as only the card title.
+    /// - [`BRIEF_DELIVERY_AUTO`] (default): decide from the resolved launchable form - type
+    ///   the brief when the launch goes through `cmd.exe` (a shim), else pass it as an
+    ///   argument. Reuses the finding #2 `agents::launchable_command` signal.
+    #[serde(default = "default_brief_delivery")]
+    pub brief_delivery: String,
 }
 
 /// `[signals]`: the tier-3 busy signature and the tier-2 native mechanism name.
@@ -126,6 +140,25 @@ pub struct ComposerSection {
     /// claude-tuned empty-composer classification).
     #[serde(default)]
     pub ready_signature: String,
+}
+
+/// `adapter.brief_delivery`: pass the composed brief as the `{prompt}` launch argument
+/// (safe for a native exe; proven for claude).
+pub const BRIEF_DELIVERY_ARGV: &str = "argv";
+/// `adapter.brief_delivery`: type the composed brief after launch via the readiness-gated
+/// verified-submit path (required for a shim harness whose launch-argument brief would be
+/// truncated at the first newline by `cmd.exe /c`).
+pub const BRIEF_DELIVERY_TYPED: &str = "typed";
+/// `adapter.brief_delivery`: decide from the resolved launchable form - typed for a
+/// `cmd.exe` shim launch, argv otherwise. The default.
+pub const BRIEF_DELIVERY_AUTO: &str = "auto";
+
+/// Every accepted `adapter.brief_delivery` value.
+const BRIEF_DELIVERY_MODES: &[&str] =
+    &[BRIEF_DELIVERY_ARGV, BRIEF_DELIVERY_TYPED, BRIEF_DELIVERY_AUTO];
+
+fn default_brief_delivery() -> String {
+    BRIEF_DELIVERY_AUTO.to_string()
 }
 
 /// `composer.submit_key`: the default submit key (carriage return).
@@ -288,6 +321,12 @@ impl Manifest {
         }
         if self.composer.popup_settle_ms == 0 {
             return Err(self.invalid("composer.popup_settle_ms must be greater than zero"));
+        }
+        let delivery = self.adapter.brief_delivery.as_str();
+        if !BRIEF_DELIVERY_MODES.contains(&delivery) {
+            return Err(self.invalid(&format!(
+                "adapter.brief_delivery must be one of {BRIEF_DELIVERY_MODES:?}, got '{delivery}'"
+            )));
         }
         let ci_method = self.context_injection.method.as_str();
         if !CI_METHODS.contains(&ci_method) {
@@ -658,6 +697,44 @@ ready_signature = "ready >"
         )
         .unwrap();
         assert_eq!(crlf.composer.submit_bytes(), b"\r\n");
+    }
+
+    #[test]
+    fn brief_delivery_reflects_the_launch_form_per_harness() {
+        // claude ships a native exe, so its multi-line brief rides the launch argument;
+        // the three shim harnesses launch through cmd.exe (which truncates a multi-line
+        // argument), so their brief is delivered TYPED after launch (finding: shim brief
+        // truncation). An absent field defaults to auto.
+        let set = ManifestSet::bundled().unwrap();
+        assert_eq!(set.get("claude").unwrap().adapter.brief_delivery, BRIEF_DELIVERY_ARGV);
+        for name in ["codex", "opencode", "pi"] {
+            assert_eq!(
+                set.get(name).unwrap().adapter.brief_delivery,
+                BRIEF_DELIVERY_TYPED,
+                "{name} must deliver its brief typed (shim launch truncates a launch arg)"
+            );
+        }
+        // A manifest with no brief_delivery field defaults to auto (decide from the
+        // launchable form), never accidentally forcing one mode.
+        let m = Manifest::parse(
+            "x",
+            "[adapter]\nname=\"x\"\ncommand=\"x\"\nlaunch=[\"{command}\",\"{prompt}\"]\n",
+        )
+        .unwrap();
+        assert_eq!(m.adapter.brief_delivery, BRIEF_DELIVERY_AUTO);
+    }
+
+    #[test]
+    fn invalid_brief_delivery_is_rejected() {
+        let text = r#"
+[adapter]
+name = "bad"
+command = "bad"
+launch = ["{command}", "{prompt}"]
+brief_delivery = "telepathy"
+"#;
+        let err = Manifest::parse("bad", text).unwrap_err();
+        assert!(matches!(err, ManifestError::Invalid { .. }));
     }
 
     #[test]
