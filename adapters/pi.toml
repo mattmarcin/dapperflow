@@ -15,6 +15,12 @@ model_flag = ["--model", "{model}"]        # [D] provider/id, also sonnet:high s
 effort_flag = ["--thinking", "{effort}"]   # [D] off|minimal|low|medium|high|xhigh
 env = {}
 no_auto_steer = false
+# pi installs as a `pi.cmd` shim launched through `cmd.exe /c` (finding #2), which
+# truncates a multi-line argument at the first newline. The composed brief is multi-line,
+# so it is TYPED after launch via the readiness-gated verified-submit path (finding #3)
+# rather than passed as a positional launch argument. [D] docs-derived; pi is not installed
+# on this machine, so it inherits the same delivery contract as codex/opencode.
+brief_delivery = "typed"
 
 [signals]
 busy_signature = "esc to interrupt"   # [S] busy footer text, not installed to probe

@@ -13,7 +13,11 @@
 //!
 //! `{brief}` is replaced with the composed brief; omit it to launch without one.
 
-use crate::manifest::bundled_manifests;
+use std::path::Path;
+
+use crate::manifest::{
+    bundled_manifests, Manifest, BRIEF_DELIVERY_ARGV, BRIEF_DELIVERY_TYPED,
+};
 
 /// The default harness when a dispatch request names none.
 pub const DEFAULT_HARNESS: &str = "claude";
@@ -33,8 +37,12 @@ pub fn is_known_adapter(adapter: &str) -> bool {
     adapter == "custom" || bundled_manifests().get(adapter).is_some()
 }
 
-/// Resolve the launch argv for a legacy built-in `harness`, substituting `brief` and
+/// Resolve the launch argv for a legacy built-in `harness`, substituting `prompt` and
 /// the optional model/effort axes from the adapter manifest.
+///
+/// `prompt` is the composed brief for an argv-delivery harness, or `None` to leave the
+/// brief out of the argv entirely (a typed-delivery harness types it after launch, so the
+/// `{prompt}` slot - and any value flag before it - is dropped; see [`brief_delivery`]).
 ///
 /// Taken when no configured launcher matches. Covers only the built-in dispatchable
 /// families (claude/codex/opencode); other families need a configured launcher. A
@@ -42,18 +50,18 @@ pub fn is_known_adapter(adapter: &str) -> bool {
 /// `None` for an unknown/undispatchable harness with no override.
 pub fn harness_command(
     harness: &str,
-    brief: &str,
+    prompt: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Option<Vec<String>> {
-    if let Some(argv) = launch_override(harness, brief) {
+    if let Some(argv) = launch_override(harness, prompt) {
         return Some(argv);
     }
     if !BUILTIN_DISPATCHABLE.contains(&harness) {
         return None;
     }
     let manifest = bundled_manifests().get(harness)?;
-    Some(manifest.build_launch(harness, Some(brief), model, effort))
+    Some(manifest.build_launch(harness, prompt, model, effort))
 }
 
 /// Resolve the launch argv for a configured launcher (`product.md` / Settings >
@@ -68,14 +76,14 @@ pub fn launcher_command(
     name: &str,
     adapter: &str,
     command: &str,
-    brief: &str,
+    prompt: Option<&str>,
     extra_args: &[String],
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Vec<String> {
-    let mut argv = match launch_override(name, brief) {
+    let mut argv = match launch_override(name, prompt) {
         Some(base) => base,
-        None => manifest_launch(adapter, command, Some(brief), model, effort),
+        None => manifest_launch(adapter, command, prompt, model, effort),
     };
     argv.extend(extra_args.iter().cloned());
     argv
@@ -94,6 +102,65 @@ pub fn launcher_interactive_command(
     let mut argv = manifest_launch(adapter, command, None, model, effort);
     argv.extend(extra_args.iter().cloned());
     argv
+}
+
+/// How the composed dispatch brief is delivered to a launched agent
+/// (`adapters.md` / Dispatch brief delivery).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BriefDelivery {
+    /// Pass the brief as the `{prompt}` launch argument (native exe; proven for claude).
+    Argv,
+    /// Type the brief after launch via the readiness-gated verified-submit path (a shim
+    /// harness whose launch-argument brief `cmd.exe` would truncate at the first newline).
+    Typed,
+}
+
+/// Decide how a dispatched harness receives its composed brief (`adapters.md` / Dispatch
+/// brief delivery; audit finding on shim truncation).
+///
+/// `manifest` is the resolved adapter manifest (`None` for an unmanifested custom/stub
+/// launcher, which cannot do verified submit and so keeps the argv path). `command` is the
+/// resolved launch argv *before* it is rewritten for spawn - its `command[0]` determines
+/// the launchable form.
+///
+/// Precedence:
+/// - an explicit manifest `brief_delivery = "argv" | "typed"` wins (a data override);
+/// - otherwise (`auto`, the default) the launchable form decides: a launch that resolves to
+///   run through `cmd.exe /c` (a `.cmd`/`.bat` shim - the finding #2 case) truncates a
+///   multi-line argument at the first newline, so the brief is typed; a native executable
+///   keeps the proven argv path. This reuses the finding #2
+///   [`crate::agents::launchable_command`] signal, so the decision tracks how the process
+///   actually launches rather than a hardcoded per-name assumption.
+pub fn brief_delivery(manifest: Option<&Manifest>, command: &[String]) -> BriefDelivery {
+    match manifest.map(|m| m.adapter.brief_delivery.as_str()) {
+        Some(BRIEF_DELIVERY_ARGV) => BriefDelivery::Argv,
+        Some(BRIEF_DELIVERY_TYPED) => BriefDelivery::Typed,
+        // `auto`: decide from the resolved launchable form.
+        Some(_) => {
+            if launches_via_cmd_exe(command) {
+                BriefDelivery::Typed
+            } else {
+                BriefDelivery::Argv
+            }
+        }
+        // No manifest (custom/stub launcher): no verified-submit path, so keep argv.
+        None => BriefDelivery::Argv,
+    }
+}
+
+/// Whether the resolved spawn form of `command` runs through `cmd.exe` - i.e. the launch
+/// is a `.cmd`/`.bat` shim (or already targets `cmd.exe`), the case `cmd.exe /c` truncates
+/// a multi-line argument on. Reuses the finding #2 launch resolver; on a non-Windows
+/// target `launchable_command` is a pass-through, so this is always false (no `cmd.exe`,
+/// no truncation).
+fn launches_via_cmd_exe(command: &[String]) -> bool {
+    let launchable = crate::agents::launchable_command(command);
+    launchable.first().is_some_and(|program| {
+        Path::new(program)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .is_some_and(|f| f.eq_ignore_ascii_case("cmd.exe"))
+    })
 }
 
 /// Resolve the resume argv for a harness family from its manifest, or `None` when the
@@ -142,11 +209,13 @@ pub fn preview(text: &str, max: usize) -> String {
     }
 }
 
-fn launch_override(harness: &str, brief: &str) -> Option<Vec<String>> {
+fn launch_override(harness: &str, prompt: Option<&str>) -> Option<Vec<String>> {
     let key = format!("DFLOW_LAUNCH_{}", harness.to_ascii_uppercase());
     let raw = std::env::var(key).ok()?;
     let argv = parse_argv(&raw)?;
-    Some(substitute(argv.into_iter(), brief))
+    // A typed-delivery launch passes `None`, so the `{brief}` seam collapses to empty
+    // (the brief is typed after launch, never embedded in argv).
+    Some(substitute(argv.into_iter(), prompt.unwrap_or("")))
 }
 
 fn parse_argv(raw: &str) -> Option<Vec<String>> {
@@ -188,7 +257,7 @@ mod tests {
 
     #[test]
     fn claude_is_default_and_carries_autonomy_flag() {
-        let cmd = harness_command("claude", "Fix login", None, None).unwrap();
+        let cmd = harness_command("claude", Some("Fix login"), None, None).unwrap();
         assert_eq!(cmd[0], "claude");
         assert!(cmd.contains(&"--permission-mode".to_string()));
         assert!(cmd.contains(&"acceptEdits".to_string()));
@@ -198,23 +267,34 @@ mod tests {
     #[test]
     fn model_and_effort_axes_reach_the_argv() {
         // The Phase 2 fix: model/effort now actually flow onto the launch line.
-        let cmd = harness_command("claude", "b", Some("haiku"), Some("high")).unwrap();
+        let cmd = harness_command("claude", Some("b"), Some("haiku"), Some("high")).unwrap();
         assert!(cmd.windows(2).any(|w| w == ["--model", "haiku"]));
         assert!(cmd.windows(2).any(|w| w == ["--effort", "high"]));
     }
 
     #[test]
     fn codex_and_opencode_shapes() {
-        assert_eq!(harness_command("codex", "b", None, None).unwrap(), vec!["codex", "b"]);
+        assert_eq!(harness_command("codex", Some("b"), None, None).unwrap(), vec!["codex", "b"]);
         assert_eq!(
-            harness_command("opencode", "b", None, None).unwrap(),
+            harness_command("opencode", Some("b"), None, None).unwrap(),
             vec!["opencode", "--prompt", "b"]
         );
     }
 
     #[test]
+    fn no_prompt_keeps_the_brief_out_of_argv() {
+        // A typed-delivery harness resolves with `None`: the `{prompt}` slot - and the
+        // dangling `--prompt` before it - are dropped, so nothing multi-line rides the argv.
+        assert_eq!(harness_command("codex", None, None, None).unwrap(), vec!["codex"]);
+        assert_eq!(harness_command("opencode", None, None, None).unwrap(), vec!["opencode"]);
+        // Axes still splice; only the brief is absent.
+        let cmd = harness_command("codex", None, Some("gpt-5"), None).unwrap();
+        assert_eq!(cmd, vec!["codex", "-m", "gpt-5"]);
+    }
+
+    #[test]
     fn unknown_harness_is_none() {
-        assert!(harness_command("nope", "b", None, None).is_none());
+        assert!(harness_command("nope", Some("b"), None, None).is_none());
     }
 
     #[test]
@@ -228,8 +308,66 @@ mod tests {
     #[test]
     fn built_in_harness_no_longer_launches_unverified_families() {
         // cursor/pi are reachable only via a configured launcher, not the legacy path.
-        assert!(harness_command("cursor", "b", None, None).is_none());
-        assert!(harness_command("pi", "b", None, None).is_none());
+        assert!(harness_command("cursor", Some("b"), None, None).is_none());
+        assert!(harness_command("pi", Some("b"), None, None).is_none());
+    }
+
+    #[test]
+    fn brief_delivery_honors_an_explicit_manifest_field() {
+        let set = crate::manifest::ManifestSet::bundled().unwrap();
+        // claude declares argv; the resolved command is irrelevant to an explicit field.
+        assert_eq!(
+            brief_delivery(set.get("claude"), &["claude".to_string(), "brief".to_string()]),
+            BriefDelivery::Argv
+        );
+        // codex/opencode/pi declare typed, regardless of the resolved command shape.
+        for name in ["codex", "opencode", "pi"] {
+            assert_eq!(
+                brief_delivery(set.get(name), &[name.to_string()]),
+                BriefDelivery::Typed,
+                "{name} declares typed delivery"
+            );
+        }
+    }
+
+    #[test]
+    fn brief_delivery_without_a_manifest_is_argv() {
+        // An unmanifested custom/stub launcher (no verified-submit path) keeps argv, even
+        // when it launches through cmd.exe - this is why the cmd.exe stub dispatch test,
+        // which has no manifest, still receives its brief as a launch argument.
+        assert_eq!(
+            brief_delivery(None, &["cmd.exe".to_string(), "/c".to_string(), "echo hi".to_string()]),
+            BriefDelivery::Argv
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn brief_delivery_auto_reads_the_launchable_form() {
+        // An `auto` manifest decides from how the process actually launches: a `.cmd` shim
+        // (resolved to run under cmd.exe) -> typed; a native `.exe` -> argv.
+        let auto = Manifest::parse(
+            "auto",
+            "[adapter]\nname=\"auto\"\ncommand=\"auto\"\nlaunch=[\"{command}\",\"{prompt}\"]\nbrief_delivery=\"auto\"\n",
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "dflow-delivery-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("shimtool.cmd"), "@echo hi\r\n").unwrap();
+        std::fs::write(dir.join("nativetool.exe"), b"MZ").unwrap();
+
+        // The decision function resolves command[0] on the real PATH, so point the probe at
+        // absolute shim/exe paths under our temp dir (resolved verbatim, no PATH needed).
+        let shim = dir.join("shimtool.cmd").to_string_lossy().into_owned();
+        let native = dir.join("nativetool.exe").to_string_lossy().into_owned();
+        assert_eq!(brief_delivery(Some(&auto), &[shim]), BriefDelivery::Typed);
+        assert_eq!(brief_delivery(Some(&auto), &[native]), BriefDelivery::Argv);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -240,7 +378,7 @@ mod tests {
             "cc-alt",
             "claude",
             "claude",
-            "Fix login",
+            Some("Fix login"),
             &["--dangerously-skip-permissions".to_string()],
             None,
             None,
@@ -263,7 +401,7 @@ mod tests {
             "oc",
             "opencode",
             "opencode",
-            "brief",
+            Some("brief"),
             &["--extra".to_string()],
             None,
             None,
@@ -274,18 +412,37 @@ mod tests {
 
     #[test]
     fn launcher_argv_custom_adapter_has_no_flags() {
-        let argv = launcher_command("mine", "custom", "my-cli", "brief", &[], None, None);
+        let argv = launcher_command("mine", "custom", "my-cli", Some("brief"), &[], None, None);
         assert_eq!(argv, vec!["my-cli", "brief"]);
+    }
+
+    #[test]
+    fn launcher_argv_typed_delivery_omits_the_brief() {
+        // A typed-delivery launcher resolves with `None`, so the brief never reaches argv;
+        // opencode's `--prompt` is dropped rather than left dangling.
+        let argv = launcher_command("oc", "opencode", "opencode", None, &["--x".to_string()], None, None);
+        assert_eq!(argv, vec!["opencode", "--x"]);
     }
 
     #[test]
     fn launcher_override_replaces_base_but_keeps_extra_args() {
         // SAFETY: sets/removes a process-global env var; no other test reads this key.
         std::env::set_var("DFLOW_LAUNCH_STUBBY", r#"["cmd.exe","/k","echo {brief}"]"#);
-        let argv =
-            launcher_command("stubby", "claude", "claude", "hello", &["--x".to_string()], None, None);
+        let argv = launcher_command(
+            "stubby",
+            "claude",
+            "claude",
+            Some("hello"),
+            &["--x".to_string()],
+            None,
+            None,
+        );
+        // A typed-delivery resolution passes None, so the {brief} seam collapses to empty.
+        let typed =
+            launcher_command("stubby", "claude", "claude", None, &["--x".to_string()], None, None);
         std::env::remove_var("DFLOW_LAUNCH_STUBBY");
         assert_eq!(argv, vec!["cmd.exe", "/k", "echo hello", "--x"]);
+        assert_eq!(typed, vec!["cmd.exe", "/k", "echo ", "--x"]);
     }
 
     #[test]

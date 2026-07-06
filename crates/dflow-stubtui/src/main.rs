@@ -11,12 +11,21 @@
 //! - `never`: Enter never submits (drives the failure path).
 //!
 //! An Enter on an empty composer is always ignored, so verified-submit retries are safe.
+//!
+//! When `DFLOW_STUB_CAPTURE` names a file, every input byte the stub receives (printable
+//! characters and newlines, excluding the daemon's DSR escape replies) is mirrored to that
+//! file. A dispatch/first-prompt brief delivered by TYPED injection thus lands in the file
+//! in full - so a test can prove the WHOLE multi-line brief reached the agent's input and
+//! was not truncated at the first newline (the `cmd.exe /c` shim-launch bug this proves
+//! fixed). The composer/submit behavior is unchanged, so verified submit still works.
 
 use std::io::{Read, Write};
 use std::time::Duration;
 
 fn main() {
     let mode = std::env::var("DFLOW_STUB_MODE").unwrap_or_else(|_| "normal".to_string());
+    let capture_path = std::env::var("DFLOW_STUB_CAPTURE").ok();
+    let mut received: Vec<u8> = Vec::new();
     let mut composer = String::new();
     let mut transcript: Vec<String> = Vec::new();
     let mut popup_dismissed = false;
@@ -47,7 +56,8 @@ fn main() {
 
         if b == 0x1b {
             // Consume and ignore a CSI escape sequence (e.g. the DSR reply the daemon
-            // feeds back), reading until the final byte in 0x40..=0x7e.
+            // feeds back), reading until the final byte in 0x40..=0x7e. Escape bytes are
+            // daemon noise, not brief content, so they are never mirrored to the capture.
             let mut e = [0u8; 1];
             if lock.read(&mut e).unwrap_or(0) == 0 {
                 break;
@@ -63,6 +73,13 @@ fn main() {
                 }
             }
             continue;
+        }
+
+        // Mirror every real input byte (printable + newlines) so a test can read back the
+        // full brief that reached the composer, regardless of how Enter is interpreted.
+        if is_enter || b == b'\n' || (0x20..0x7f).contains(&b) {
+            received.push(b);
+            capture(&capture_path, &received);
         }
 
         if is_enter {
@@ -88,6 +105,14 @@ fn main() {
             composer.push(b as char);
             render(&mut out, &transcript, &composer, &mode);
         }
+    }
+}
+
+/// Mirror the received input bytes to the capture file, if one is configured. Overwrites
+/// with the full accumulator each time so the file always holds everything received so far.
+fn capture(path: &Option<String>, received: &[u8]) {
+    if let Some(p) = path {
+        let _ = std::fs::write(p, received);
     }
 }
 
