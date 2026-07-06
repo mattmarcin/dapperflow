@@ -299,7 +299,7 @@ async fn live_new_session_first_prompt_and_steer() {
         }
         let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
         if let Some(m) = model {
-            let flag = if *name == "pi" || *name == "claude" { "--model" } else if *name == "opencode" { "-m" } else { "-m" };
+            let flag = if *name == "pi" || *name == "claude" { "--model" } else { "-m" };
             args.push(flag.to_string());
             args.push(m.to_string());
         }
