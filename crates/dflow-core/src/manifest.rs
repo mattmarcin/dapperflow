@@ -110,6 +110,54 @@ pub struct ComposerSection {
     /// Cell styles that mark ghost/placeholder text to strip during classification.
     #[serde(default)]
     pub ghost_text_styles: Vec<String>,
+    /// The key that submits the composer, as a manifest keyword (`adapters.md` / Verified
+    /// submit; audit finding #3). One of `enter` (CR, the default), `lf` (LF), or `crlf`.
+    /// Some TUIs only accept a specific newline byte.
+    #[serde(default = "default_submit_key")]
+    pub submit_key: String,
+    /// How typed text is delivered: `none` (raw keystrokes, the default) or `bracketed`
+    /// (wrapped in an ESC[200~/ESC[201~ bracketed-paste envelope, so a multi-line prompt
+    /// lands as one paste and embedded newlines never submit early) (finding #3).
+    #[serde(default = "default_paste_mode")]
+    pub paste_mode: String,
+    /// Optional positive readiness marker: a substring that, once visible, confirms the
+    /// composer is drawn and ready to accept input. Empty means "no positive marker; rely
+    /// on not-busy + not-dialog + drawn" (finding #3: the readiness gate must not depend on
+    /// claude-tuned empty-composer classification).
+    #[serde(default)]
+    pub ready_signature: String,
+}
+
+/// `composer.submit_key`: the default submit key (carriage return).
+pub const SUBMIT_KEY_ENTER: &str = "enter";
+/// `composer.paste_mode`: raw keystrokes, no bracketed-paste envelope (default).
+pub const PASTE_MODE_NONE: &str = "none";
+/// `composer.paste_mode`: wrap typed text in a bracketed-paste envelope.
+pub const PASTE_MODE_BRACKETED: &str = "bracketed";
+
+fn default_submit_key() -> String {
+    SUBMIT_KEY_ENTER.to_string()
+}
+
+fn default_paste_mode() -> String {
+    PASTE_MODE_NONE.to_string()
+}
+
+impl ComposerSection {
+    /// The bytes that submit the composer, from `submit_key` (`enter` -> CR is the safe
+    /// default any TUI accepts; `lf`/`crlf` for the few that need a bare or paired LF).
+    pub fn submit_bytes(&self) -> Vec<u8> {
+        match self.submit_key.to_ascii_lowercase().as_str() {
+            "lf" | "newline" | "ctrl+j" => vec![b'\n'],
+            "crlf" => vec![b'\r', b'\n'],
+            _ => vec![b'\r'],
+        }
+    }
+
+    /// Whether typed text should be wrapped in a bracketed-paste envelope.
+    pub fn uses_bracketed_paste(&self) -> bool {
+        self.paste_mode.eq_ignore_ascii_case(PASTE_MODE_BRACKETED)
+    }
 }
 
 impl Default for ComposerSection {
@@ -118,6 +166,9 @@ impl Default for ComposerSection {
             popup_prefixes: Vec::new(),
             popup_settle_ms: default_settle_ms(),
             ghost_text_styles: Vec::new(),
+            submit_key: default_submit_key(),
+            paste_mode: default_paste_mode(),
+            ready_signature: String::new(),
         }
     }
 }
@@ -567,6 +618,46 @@ launch = ["{command}", "{prompt}"]
         assert_eq!(c.popup_prefixes, vec!["/".to_string()]);
         assert!(c.popup_settle_ms > 0);
         assert!(c.ghost_text_styles.iter().any(|s| s == "dim"));
+    }
+
+    #[test]
+    fn composer_input_defaults_are_enter_and_raw() {
+        // Every launch-set harness was proven to accept the default Enter/raw input
+        // (finding #3 live matrix), so the four ship with the defaults, not overrides.
+        let set = ManifestSet::bundled().unwrap();
+        for name in ["claude", "codex", "opencode", "pi"] {
+            let c = &set.get(name).unwrap().composer;
+            assert_eq!(c.submit_bytes(), b"\r", "{name} submits on CR");
+            assert!(!c.uses_bracketed_paste(), "{name} needs no bracketed paste");
+        }
+    }
+
+    #[test]
+    fn composer_submit_and_paste_are_manifest_driven() {
+        // A harness that needs a bare LF submit and bracketed paste can declare it as
+        // data, no code change (finding #3: manifest-driven input knobs).
+        let text = r#"
+[adapter]
+name = "lf"
+command = "lf"
+launch = ["{command}", "{prompt}"]
+
+[composer]
+submit_key = "lf"
+paste_mode = "bracketed"
+ready_signature = "ready >"
+"#;
+        let m = Manifest::parse("lf", text).unwrap();
+        assert_eq!(m.composer.submit_bytes(), b"\n");
+        assert!(m.composer.uses_bracketed_paste());
+        assert_eq!(m.composer.ready_signature, "ready >");
+        // crlf submits with a paired CR LF.
+        let crlf = Manifest::parse(
+            "crlf",
+            "[adapter]\nname=\"c\"\ncommand=\"c\"\nlaunch=[\"{command}\"]\n[composer]\nsubmit_key=\"crlf\"\n",
+        )
+        .unwrap();
+        assert_eq!(crlf.composer.submit_bytes(), b"\r\n");
     }
 
     #[test]

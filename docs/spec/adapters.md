@@ -43,6 +43,12 @@ trust = { pattern = "Do you trust", response = "enter" }
 popup_prefixes = ["/"]
 popup_settle_ms = 1200
 ghost_text_styles = ["dim"]
+# input delivery knobs (finding #3): the submit key, whether typed text is wrapped in a
+# bracketed-paste envelope, and an optional positive readiness marker. All four launch-set
+# harnesses were proven to work with the defaults below, so their manifests omit them.
+submit_key = "enter"        # enter (CR, default) | lf | crlf
+paste_mode = "none"         # none (default) | bracketed
+ready_signature = ""        # optional substring that confirms the composer is drawn
 ```
 
 ## Three-tier signal model
@@ -76,6 +82,20 @@ Algorithm (all reads against the daemon's own screen model):
 Every adapter must pass the stub-TUI verified-submit test matrix (popup swallow, placeholder expansion, ghost text, slow redraw) plus an opt-in live-CLI smoke run, and ship composer-state test fixtures (recorded screen captures of empty, typed, popup-open, and placeholder states) so classification regressions are caught offline.
 A manifest may declare `no_auto_steer = true` when its composer cannot be classified reliably; such sessions accept human typing but automated steering is refused with a Needs You explanation rather than attempted blind.
 
+### Readiness gate (finding #3)
+
+Before typing (first prompt or steer) the daemon waits for the TUI to be ready.
+The gate is harness-agnostic: alive, drawn, not mid-turn (busy signature absent), and not parked on a trust/permission dialog, confirmed across two consecutive polls, plus an optional positive per-harness `ready_signature`.
+It deliberately does **not** require an `empty composer` classification: that check was claude-tuned and misread every other harness's boxed composer (heavy box-drawing prompt markers, placeholder ghost styles, cursor-row differences), so the gate never passed for codex/opencode/pi and typed injection never fired (`attempts: 0`, `$0` spent) - the exact finding #3 defect.
+The submit key and paste mode are manifest data (`composer.submit_key`, `composer.paste_mode`), so a harness that needs a bare LF or a bracketed-paste envelope is a manifest edit, not a code change.
+
+### First-prompt delivery: typed, not launch-argument (finding #3)
+
+The first prompt is delivered by the same readiness-gated typed path as steering, not as a launch argument.
+On Windows the non-claude CLIs launch through a `.cmd` shim run under `cmd.exe /c` (finding #2), and `cmd.exe` truncates **any** multi-line argument at the first newline (verified: a multi-line arg reaches the shim empty).
+Since the standing dflow guidance prepended to a New-Session first prompt is multi-line, a launch-argument prompt would arrive truncated on codex/opencode/pi; the typed path carries the full multi-line prompt intact.
+This was proven live for all four harnesses (see the capability matrix and `docs/spikes/fix-harness-io.md`).
+
 ## Capability matrix (filled by M0 spike 2, harness signal audit, 2026-07-04)
 
 Verification tags: `[L]` VERIFIED-LOCAL (command run on this machine, quoted in the spike file), `[D]` VERIFIED-DOCS (official doc URL cited in the spike file), `[S]` SEED (prior-art value, still needs a live-session probe in Phase 2).
@@ -83,7 +103,11 @@ Full evidence (command outputs, doc URLs, per-harness recommendation) lives in `
 
 | Capability | claude | codex | opencode | pi |
 |---|---|---|---|---|
-| Version on this machine | `2.1.200` `[L]` | `codex-cli 0.142.5` `[L]` | `1.17.13` `[L]` | not installed, facts from docs only |
+| Version on this machine | `2.1.200` `[L]` | `codex-cli 0.142.5` `[L]` | `1.17.13` `[L]` | `0.80.3` `[L]` |
+| Launch, no os error 193 (finding #2) | native `claude.exe`, direct `[L]` | `codex.cmd` shim via `cmd.exe /c` `[L]` | `opencode.cmd` shim via `cmd.exe /c` `[L]` | `pi.cmd` shim via `cmd.exe /c` `[L]` |
+| First prompt reaches agent, spends tokens (finding #3) | typed, replied on haiku `[L]` | typed, replied `[L]` | typed, replied on glm-5.2 `[L]` | typed, replied `[L]` |
+| Verified-submit steering (finding #3) | `attempts:1 submitted:true`, replied `[L]` | `attempts:1 submitted:true`, replied `[L]` | `attempts:1 submitted:true`, replied `[L]` | `attempts:1 submitted:true`, replied `[L]` |
+| Submit key / paste mode | `enter` / `none` `[L]` | `enter` / `none` `[L]` | `enter` / `none` `[L]` | `enter` / `none` `[L]` |
 | Busy signature | `esc to interrupt` `[S]` | interrupt hint in TUI footer `[S]` | interrupt hint, double-Esc `[S]` | busy footer text `[S]` |
 | Native turn/stop signal (tier 2) | Stop / SubagentStop / Notification hooks in settings.json, command or HTTP transport `[D]`; `--output-format stream-json --include-hook-events` `[L]` | `notify` program fires on `agent-turn-complete` (user-level config) `[D]`; `exec --json` JSONL event stream `[L]` | server SSE `GET /event` emitting `session.idle` `[D]`; plugin `session.idle` hook `[D]` | none native (no hooks, no notify); `--mode json` / `--mode rpc` event stream `[D]` |
 | Headless/structured mode | `-p/--print` with `--output-format json\|stream-json`, `--json-schema` `[L]` | `codex exec --json` (JSONL), `--output-schema`, `-o` last-message `[L]` | `opencode serve` (:4096 HTTP+SSE), `run --format json`, `acp` `[L]`/`[D]` | `-p/--print`, `--mode json`, `--mode rpc` `[D]` |
@@ -139,6 +163,9 @@ Capture mechanism per harness, researched 2026-07-04:
 6. Compose brief: card brief + acceptance criteria + project memory digest + recipe stage guidance + `dflow` usage contract.
 7. Launch per manifest; watch for trust dialogs within the first N seconds and answer per manifest; confirm the brief started processing.
 8. Supervision loop consumes signals; state transitions append `card_events` and update Needs You.
+
+Known constraint (discovered in the finding #2/#3 audit, `docs/spikes/fix-harness-io.md`): dispatch delivers the composed brief as the `{prompt}` launch argument, but on Windows a shim-launched harness (codex/opencode/pi via `cmd.exe /c`) truncates a multi-line argument at the first newline, so only the brief's first line (the card title) reaches the agent.
+The robust fix is to deliver the dispatch brief for shim harnesses via the same readiness-gated typed path used for the New-Session first prompt (finding #3), rather than a truncated launch argument; native-exe harnesses (claude) are unaffected.
 
 ## Steering and recovery
 
