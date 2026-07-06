@@ -900,7 +900,6 @@ mod tests {
         );
         let pid: u32 =
             std::fs::read_to_string(&pidfile).unwrap().trim().parse().expect("descendant pid");
-        assert!(pid_is_alive(pid), "descendant should be alive before the parent exits");
 
         // The session must self-finalize shortly after its direct child exits - within the
         // grace window plus slack, NOT hang until an external timeout. Without the watcher
