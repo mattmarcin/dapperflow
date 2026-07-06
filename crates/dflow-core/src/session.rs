@@ -155,8 +155,14 @@ impl Session {
             .openpty(PtySize { rows: spec.rows, cols: spec.cols, pixel_width: 0, pixel_height: 0 })
             .map_err(|e| SessionError::Pty(format!("openpty: {e}")))?;
 
-        let mut cmd = CommandBuilder::new(&spec.command[0]);
-        for arg in &spec.command[1..] {
+        // Resolve the program to a launchable Windows form before spawning: a bare
+        // manifest command like `codex`/`opencode`/`pi` otherwise resolves (inside
+        // portable-pty) to an extension-less `#!/bin/sh` shim that `CreateProcessW`
+        // rejects with os error 193; a `.cmd`/`.bat` shim is rewritten to run under
+        // `cmd.exe /c` (`agents::launchable_command`; audit finding #2).
+        let launch_argv = crate::agents::launchable_command(&spec.command);
+        let mut cmd = CommandBuilder::new(&launch_argv[0]);
+        for arg in &launch_argv[1..] {
             cmd.arg(arg);
         }
         if let Some(cwd) = &spec.cwd {
@@ -248,6 +254,13 @@ impl Session {
             .name(format!("pty-reader-{id}"))
             .spawn(move || pump_reader(reader, reader_session))?;
 
+        // Watch the direct child so the session self-terminates when the agent CLI exits,
+        // even if a ConPTY descendant keeps the pty open (EOF never arrives) (`finding #5`).
+        let watch_session = Arc::clone(&session);
+        thread::Builder::new()
+            .name(format!("pty-watch-{id}"))
+            .spawn(move || watch_child(watch_session))?;
+
         Ok(session)
     }
 
@@ -258,16 +271,30 @@ impl Session {
 
     /// Record the session's exit transition exactly once (persisted sessions only).
     /// Every store-backed session persists a row now (carded or cardless), so the
-    /// finalize runs whenever a store is present.
-    fn finalize_exit(&self) {
+    /// finalize runs whenever a store is present. `note` carries the child's exit code
+    /// when the session self-terminated (`finding #5`), else `None`.
+    fn finalize_exit(&self, note: Option<String>) {
         if self.finalized.swap(true, Ordering::SeqCst) {
             return;
         }
         if let Some(store) = &self.store {
-            if let Err(err) = store.finalize_session(&self.id.to_string(), session_state::DONE) {
+            if let Err(err) = store.finalize_session_note(
+                &self.id.to_string(),
+                session_state::DONE,
+                note.as_deref(),
+            ) {
                 tracing::debug!(session_id = %self.id, %err, "could not finalize session row");
             }
         }
+    }
+
+    /// Tear down the whole process tree (the per-session Job Object reaps every
+    /// descendant, then the direct child is killed) and mark the session not-alive.
+    /// Does NOT finalize the row; callers pair it with [`Session::finalize_exit`].
+    fn teardown_tree(&self) {
+        self.kill_guard.lock().expect("kill guard poisoned").kill();
+        let _ = self.child.lock().expect("session child poisoned").kill();
+        self.inner.lock().expect("session inner poisoned").alive = false;
     }
 
     /// The 16-byte form of the session id used in binary PTY frames.
@@ -378,10 +405,8 @@ impl Session {
 
     /// Terminate the session and its whole process tree.
     pub fn kill(&self) {
-        self.kill_guard.lock().expect("kill guard poisoned").kill();
-        let _ = self.child.lock().expect("session child poisoned").kill();
-        self.inner.lock().expect("session inner poisoned").alive = false;
-        self.finalize_exit();
+        self.teardown_tree();
+        self.finalize_exit(None);
     }
 
     /// Graceful-shutdown teardown: mark the persisted row `interrupted` (not `done`) so
@@ -478,9 +503,67 @@ fn pump_reader(mut reader: Box<dyn Read + Send>, session: Arc<Session>) {
     if let Ok(mut inner) = session.inner.lock() {
         inner.alive = false;
     }
-    // The child exited on its own; record the terminal transition (once).
-    session.finalize_exit();
+    // The pty reached EOF (every client, including any lingering descendant, is gone);
+    // record the terminal transition (once). The child-exit watcher may have finalized
+    // first with the exit code; whichever runs first wins (finalize is idempotent).
+    session.finalize_exit(None);
     tracing::debug!(session_id = %session.id, "pty reader loop ended");
+}
+
+/// How long to wait after the DIRECT child exits before finalizing the session, so the
+/// pty reader can drain the child's final output first (`finding #5`). Overridable via
+/// `DFLOW_CHILD_EXIT_GRACE_MS` for ops tuning and tests.
+fn child_exit_grace() -> std::time::Duration {
+    std::env::var("DFLOW_CHILD_EXIT_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(std::time::Duration::from_millis(500))
+}
+
+/// Poll interval for the direct-child exit watcher.
+const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Watch the DIRECT child process and finalize the session when it exits, even when a
+/// ConPTY descendant keeps the pty open so the reader never sees EOF (`finding #5`: a real
+/// agent CLI can exit while a lingering grandchild holds the pseudo-console, so relying on
+/// the reader's EOF alone leaves the session "alive" until an external timeout force-kills
+/// it - which killed a gate fixer mid-work in the live audit).
+///
+/// On exit: a short grace period to flush final output, then tear down the whole tree via
+/// the per-session Job Object (which reaps the lingering descendant and, once the last pty
+/// client is gone, lets the reader reach EOF), and finalize the row `done` with the child's
+/// exit code. The daemon-wide reaping job (`job.rs`) remains the outer safety net.
+fn watch_child(session: Arc<Session>) {
+    loop {
+        let status = {
+            let mut child = match session.child.lock() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            match child.try_wait() {
+                Ok(status) => status,
+                // Cannot observe the child; leave finalization to the reader/kill paths.
+                Err(_) => return,
+            }
+        };
+        match status {
+            Some(status) => {
+                // Let the reader drain any last output before we tear the pty down.
+                thread::sleep(child_exit_grace());
+                session.teardown_tree();
+                session.finalize_exit(Some(format!("exited (code {})", status.exit_code())));
+                return;
+            }
+            None => {
+                // Already finalized elsewhere (explicit kill / shutdown): stop watching.
+                if !session.is_alive() {
+                    return;
+                }
+                thread::sleep(CHILD_POLL_INTERVAL);
+            }
+        }
+    }
 }
 
 /// Owns all live sessions.
@@ -763,5 +846,106 @@ mod tests {
         assert!(mgr.kill(&session.id));
         assert_eq!(mgr.count(), 0);
         assert!(!mgr.kill(&session.id), "killing an unknown session returns false");
+    }
+
+    /// `finding #5`: a session whose direct child exits while a ConPTY descendant lingers
+    /// must SELF-terminate within the grace window (reader EOF never arrives on its own),
+    /// finalize the row `done` with the child's exit code, and reap the descendant. Before
+    /// the child-exit watcher, such a session stayed "alive" until an external timeout
+    /// force-killed it (which killed a gate fixer mid-work in the live audit).
+    #[cfg(windows)]
+    #[test]
+    fn session_self_terminates_when_child_exits_with_lingering_descendant() {
+        let stamp =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("dflow-finding5-{stamp}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("descendant.pid");
+        let parent_ps1 = dir.join("parent.ps1");
+        // The direct child launches a DETACHED `ping` in the same console (so it holds the
+        // pty open after the parent exits), records the descendant's pid so the test can
+        // confirm it was reaped, then exits. `ping -n 120` lingers far past the test window.
+        let script = format!(
+            "$p = Start-Process -NoNewWindow -FilePath 'ping' -ArgumentList @('-n','120','127.0.0.1') -PassThru\n\
+             $p.Id | Out-File -FilePath '{}' -Encoding ascii\n\
+             Start-Sleep -Milliseconds 400\n",
+            pidfile.display()
+        );
+        std::fs::write(&parent_ps1, script).unwrap();
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let mgr = SessionManager::with_store(Arc::clone(&store));
+        let spec = SessionSpec {
+            harness: "powershell".into(),
+            command: vec![
+                "powershell.exe".into(),
+                "-NoProfile".into(),
+                "-ExecutionPolicy".into(),
+                "Bypass".into(),
+                "-File".into(),
+                parent_ps1.to_string_lossy().into_owned(),
+            ],
+            cols: 80,
+            rows: 24,
+            scrollback_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let session = mgr.create(spec).expect("spawn session");
+        let sid = session.id.to_string();
+
+        // The descendant started and the parent recorded its pid (proof it holds the pty).
+        assert!(
+            wait_until(|| pidfile.exists(), Duration::from_secs(20)),
+            "parent never launched the lingering descendant"
+        );
+        let pid: u32 =
+            std::fs::read_to_string(&pidfile).unwrap().trim().parse().expect("descendant pid");
+
+        // The session must self-finalize shortly after its direct child exits - within the
+        // grace window plus slack, NOT hang until an external timeout. Without the watcher
+        // this never flips because the lingering `ping` keeps the pty from reaching EOF.
+        assert!(
+            wait_until(|| !session.is_alive(), Duration::from_secs(15)),
+            "session did not self-terminate after its child exited"
+        );
+
+        // The row is finalized terminal, `ended_at` stamped, exit code recorded.
+        let row = store.get_session(&sid).unwrap().expect("session row");
+        assert!(session_state::is_terminal(&row.state), "row not terminal: {}", row.state);
+        assert!(row.ended_at.is_some(), "ended_at not stamped");
+        assert!(
+            row.status_note.as_deref().unwrap_or_default().contains("exited"),
+            "exit code note missing: {:?}",
+            row.status_note
+        );
+
+        // The lingering descendant was reaped by the per-session Job Object.
+        assert!(
+            wait_until(|| !pid_is_alive(pid), Duration::from_secs(15)),
+            "lingering descendant {pid} was not reaped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Whether a pid is a still-running process (no unsafe process-table scan, no kill).
+    #[cfg(windows)]
+    fn pid_is_alive(pid: u32) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        // SAFETY: OpenProcess returns a handle we own (or null); it is closed exactly once.
+        // GetExitCodeProcess reads the exit status into `code`.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut code);
+            CloseHandle(handle);
+            ok != 0 && code == STILL_ACTIVE
+        }
     }
 }

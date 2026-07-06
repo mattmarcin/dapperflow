@@ -15,7 +15,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::heuristics::{self, ComposerState};
+use crate::heuristics;
 use crate::manifest::Manifest;
 use crate::session::Session;
 
@@ -41,13 +41,13 @@ pub struct SubmitConfig {
 }
 
 impl SubmitConfig {
-    /// Production timings for a harness, popup settle from its manifest.
+    /// Production timings for a harness, popup settle and submit key from its manifest.
     pub fn from_manifest(manifest: &Manifest) -> Self {
         Self {
             max_attempts: 4,
             redraw_wait: Duration::from_millis(250),
             popup_settle: Duration::from_millis(manifest.composer.popup_settle_ms.max(1)),
-            enter_bytes: b"\r".to_vec(),
+            enter_bytes: manifest.composer.submit_bytes(),
         }
     }
 }
@@ -68,8 +68,18 @@ pub fn send_verified(
     }
     let ghost = &manifest.composer.ghost_text_styles;
 
-    // 2. Type the text.
-    let _ = session.write_input(text.as_bytes());
+    // 2. Type the text. A harness that needs bracketed paste (finding #3) gets the text
+    // wrapped in the DEC 2004 envelope so a multi-line prompt lands as one paste and its
+    // embedded newlines are inserted, not treated as submits.
+    if manifest.composer.uses_bracketed_paste() {
+        let mut framed = Vec::with_capacity(text.len() + 12);
+        framed.extend_from_slice(b"\x1b[200~");
+        framed.extend_from_slice(text.as_bytes());
+        framed.extend_from_slice(b"\x1b[201~");
+        let _ = session.write_input(&framed);
+    } else {
+        let _ = session.write_input(text.as_bytes());
+    }
 
     // 2 (cont). If it starts with a popup prefix, wait for the popup to settle;
     // otherwise wait for a normal redraw.
@@ -99,13 +109,23 @@ pub fn send_verified(
     }
 }
 
-/// Wait until `session`'s composer is ready to accept a first prompt: alive, not busy,
-/// and an empty composer (`adapters.md` / dispatch flow step 7, "confirm the brief
-/// started processing"; Phase 2 first-prompt auto-submit). Returns false on timeout or
-/// exit (e.g. a trust dialog we will not blindly type into).
+/// Wait until `session`'s TUI is ready to accept typed input: alive, drawn, not mid-turn
+/// (busy), and not parked on a trust/permission dialog (`adapters.md` / dispatch flow step
+/// 7; audit finding #3).
+///
+/// The gate deliberately does NOT require an `Empty` composer classification. That check
+/// was claude-tuned and misread every other harness's boxed composer (heavy box-drawing
+/// prompt markers, placeholder ghost styles, cursor-row differences), so the gate never
+/// passed for codex/opencode/pi and typed injection never fired (`attempts: 0`, `$0`
+/// spent). Readiness is now the harness-agnostic signal set - drawn, idle, no dialog -
+/// plus an optional positive per-harness `ready_signature`, and it is confirmed across two
+/// consecutive polls so a transient idle frame mid-startup does not count. Returns false on
+/// timeout or exit (e.g. a trust dialog we will not blindly type into).
 pub fn wait_for_composer_ready(session: &Session, manifest: &Manifest, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let name = &manifest.adapter.name;
+    let ready_sig = manifest.composer.ready_signature.to_lowercase();
+    let mut consecutive = 0u8;
     loop {
         if !session.is_alive() {
             return false;
@@ -113,11 +133,16 @@ pub fn wait_for_composer_ready(session: &Session, manifest: &Manifest, timeout: 
         let plain = session.capture_plain();
         let busy = heuristics::is_busy(name, &plain);
         let dialog = heuristics::needs_input(name, &plain);
-        let cursor = session.cursor();
-        let snapshot = session.styled_snapshot();
-        let state = heuristics::classify_composer(&snapshot, cursor.row, manifest);
-        if !busy && !dialog && state == ComposerState::Empty && !plain.trim().is_empty() {
-            return true;
+        let drawn = !plain.trim().is_empty();
+        let sig_ok = ready_sig.is_empty() || plain.to_lowercase().contains(&ready_sig);
+        if drawn && !busy && !dialog && sig_ok {
+            consecutive += 1;
+            // Two consecutive idle observations (~200ms apart) confirm a settled composer.
+            if consecutive >= 2 {
+                return true;
+            }
+        } else {
+            consecutive = 0;
         }
         if Instant::now() >= deadline {
             return false;

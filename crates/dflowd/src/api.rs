@@ -2432,7 +2432,10 @@ pub fn run_send_verified(session: &Session, text: &str) -> SendVerifiedResult {
         None => return SendVerifiedResult { submitted: false, attempts: 0 },
     };
     let cfg = SubmitConfig::from_manifest(manifest);
-    if !steer::wait_for_composer_ready(session, manifest, Duration::from_secs(8)) {
+    // Allow a generous readiness window: a harness can be mid-startup (e.g. codex loading
+    // MCP servers shows the busy signature for several seconds) when a steer arrives
+    // (finding #3). The gate returns as soon as the TUI settles.
+    if !steer::wait_for_composer_ready(session, manifest, Duration::from_secs(25)) {
         return SendVerifiedResult { submitted: false, attempts: 0 };
     }
     let outcome = steer::send_verified(session, manifest, text, &cfg);

@@ -174,6 +174,159 @@ fn resolve_on_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     None
 }
 
+/// Rewrite a session launch argv so Windows `CreateProcessW` (portable-pty's ConPTY
+/// backend) can actually spawn it (`adapters.md` / launch resolution; audit finding #2).
+///
+/// The DETECTION path already resolves a CLI to its real launchable form via `PATHEXT`
+/// (`resolve_on_path`); the SPAWN path must do the same, because portable-pty's own
+/// search prefers an *exact* (extension-less) name match over a `PATHEXT` variant. On
+/// Windows, `codex`/`opencode`/`pi` install as an extension-less `#!/bin/sh` shim next to
+/// a `codex.cmd`; portable-pty hands the bare shim to `CreateProcessW`, which fails with
+/// os error 193 ("%1 is not a valid Win32 application"). Only `claude` ships a native
+/// `.exe`, which is why it alone launched before this fix.
+///
+/// This resolves `command[0]` to its concrete launchable file, PREFERRING a launchable
+/// extension (`.exe`/`.cmd`/`.bat`/...) over the extension-less shim, and:
+/// - runs a batch shim (`.cmd`/`.bat`) through `cmd.exe /c <script> <args...>`, because
+///   `CreateProcessW` cannot execute a batch script directly (also os error 193);
+/// - uses a native executable (`.exe`/`.com`) directly, resolved to its absolute path.
+///
+/// A program that cannot be resolved on `PATH` (a shell built-in path, an unknown
+/// command, a non-Windows target) is returned unchanged so the spawn surfaces the real
+/// error rather than this masking it. Non-Windows is always a pass-through.
+pub fn launchable_command(command: &[String]) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        launchable_command_in(command, &path_dirs())
+    }
+    #[cfg(not(windows))]
+    {
+        command.to_vec()
+    }
+}
+
+/// [`launchable_command`] over an explicit set of `PATH` directories, so a test can
+/// resolve against a temp dir of stub shims without touching the real `PATH`.
+#[cfg(windows)]
+pub fn launchable_command_in(command: &[String], dirs: &[PathBuf]) -> Vec<String> {
+    let (program, args) = match command.split_first() {
+        Some(split) => split,
+        None => return command.to_vec(),
+    };
+    let resolved = match resolve_spawn_program(program, dirs) {
+        Some(p) => p,
+        // Unresolvable on PATH: leave it to the spawner to report the real error.
+        None => return command.to_vec(),
+    };
+    let program_str = resolved.to_string_lossy().into_owned();
+    if is_batch_script(&resolved) {
+        // A .cmd/.bat is not a PE image; it must be interpreted by the command shell.
+        let mut out = Vec::with_capacity(command.len() + 2);
+        out.push("cmd.exe".to_string());
+        out.push("/c".to_string());
+        out.push(program_str);
+        out.extend(args.iter().cloned());
+        out
+    } else {
+        let mut out = Vec::with_capacity(command.len());
+        out.push(program_str);
+        out.extend(args.iter().cloned());
+        out
+    }
+}
+
+/// Whether a resolved program is a batch shim that must run under `cmd.exe /c`.
+#[cfg(windows)]
+fn is_batch_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+}
+
+/// Resolve a launch program (a bare name, or a path) to its concrete launchable file.
+#[cfg(windows)]
+fn resolve_spawn_program(program: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let path = Path::new(program);
+    // A program given with a directory component (absolute, or relative with a
+    // separator) is resolved against that path, not searched on PATH.
+    if path.is_absolute() || path.components().count() > 1 {
+        return resolve_explicit_path(path);
+    }
+    resolve_launchable_on_path(program, dirs)
+}
+
+/// Resolve an explicit program path: the file itself, or, when it carries no extension,
+/// the first launchable-extension sibling (`foo` -> `foo.cmd`).
+#[cfg(windows)]
+fn resolve_explicit_path(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    if path.extension().is_none() {
+        for ext in launchable_extensions() {
+            let candidate = PathBuf::from(format!("{}{ext}", path.display()));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Search `PATH` for `name`, preferring a launchable extension (`.exe`/`.cmd`/...) over
+/// the extension-less shim, which is the whole point of the fix: the bare form is never
+/// returned, so `CreateProcessW` never receives a script it cannot execute. A name that
+/// already carries an extension (e.g. `cmd.exe`) is tried verbatim first.
+#[cfg(windows)]
+fn resolve_launchable_on_path(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let has_ext = Path::new(name).extension().is_some();
+    let exts = launchable_extensions();
+    for dir in dirs {
+        if has_ext {
+            let verbatim = dir.join(name);
+            if verbatim.is_file() {
+                return Some(verbatim);
+            }
+        }
+        for ext in &exts {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// The launchable executable extensions to try, in `PATHEXT` order, each with its leading
+/// dot. Unlike [`executable_extensions`] this NEVER includes the bare (extension-less)
+/// form: an extension-less file is exactly the shim `CreateProcessW` rejects, so the spawn
+/// resolver must never fall back to it.
+#[cfg(windows)]
+fn launchable_extensions() -> Vec<String> {
+    let mut exts: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut push = |ext: &str| {
+        let norm = ext.to_ascii_lowercase();
+        if !norm.is_empty() && norm != "." && !seen.contains(&norm) {
+            seen.push(norm);
+            exts.push(ext.to_string());
+        }
+    };
+    if let Some(pathext) = std::env::var_os("PATHEXT") {
+        for ext in std::env::split_paths(&pathext) {
+            if let Some(s) = ext.to_str() {
+                push(s);
+            }
+        }
+    }
+    // Ensure the shim kinds the product cares about are always considered.
+    for ext in [".exe", ".cmd", ".bat", ".com", ".ps1"] {
+        push(ext);
+    }
+    exts
+}
+
 /// Run `<command> --version` with a hard timeout, returning the first non-empty
 /// output line. stdout is preferred; some CLIs print the version to stderr, so that
 /// is the fallback. A non-zero exit or a timeout yields `None` (best effort).
@@ -274,6 +427,78 @@ mod tests {
         assert_eq!(codex.version.as_deref(), Some("codex-cli 1.2.3"));
         assert!(found.iter().all(|d| d.name != "opencode"), "opencode is not installed");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_resolution_skips_the_shim_for_a_launchable_cmd() {
+        // A PATH dir holding BOTH an extension-less `#!/bin/sh` shim (the os error 193
+        // trap) and a `.cmd`: the spawn resolver must pick the launchable `.cmd` and run
+        // it under `cmd.exe /c`, never the bare shim (audit finding #2).
+        let dir = std::env::temp_dir().join(format!(
+            "dflow-spawn-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("codex"), "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(dir.join("codex.cmd"), "@echo hi\r\n").unwrap();
+
+        let argv = launchable_command_in(
+            &["codex".to_string(), "-m".to_string(), "haiku".to_string()],
+            std::slice::from_ref(&dir),
+        );
+        assert_eq!(argv[0], "cmd.exe", "a batch shim must launch under cmd.exe");
+        assert_eq!(argv[1], "/c");
+        assert!(
+            argv[2].to_ascii_lowercase().ends_with("codex.cmd"),
+            "resolved to the launchable .cmd, not the shim: {:?}",
+            argv[2]
+        );
+        // The original arguments are preserved after the resolved script.
+        assert_eq!(&argv[3..], &["-m".to_string(), "haiku".to_string()]);
+        // The resolved program is a real file CreateProcessW-launchable via cmd.exe.
+        assert!(Path::new(&argv[2]).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_resolution_uses_a_native_exe_directly() {
+        // A native `.exe` (the claude case) is launched directly, not wrapped in cmd.exe.
+        let dir = std::env::temp_dir().join(format!(
+            "dflow-spawn-exe-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("claude.exe"), b"MZ").unwrap();
+
+        let argv = launchable_command_in(
+            &["claude".to_string(), "--model".to_string(), "haiku".to_string()],
+            std::slice::from_ref(&dir),
+        );
+        assert!(argv[0].to_ascii_lowercase().ends_with("claude.exe"), "native exe used directly: {argv:?}");
+        assert_eq!(&argv[1..], &["--model".to_string(), "haiku".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_resolution_passes_through_when_unresolvable() {
+        // Nothing launchable on PATH: return the command unchanged so the spawner
+        // surfaces the real "not found" error instead of this masking it.
+        let dir = std::env::temp_dir().join(format!(
+            "dflow-spawn-none-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only a bare shim, no launchable extension: not launchable, so passthrough.
+        std::fs::write(dir.join("ghosttool"), "#!/bin/sh\n").unwrap();
+        let argv = launchable_command_in(
+            &["ghosttool".to_string(), "x".to_string()],
+            std::slice::from_ref(&dir),
+        );
+        assert_eq!(argv, vec!["ghosttool".to_string(), "x".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
