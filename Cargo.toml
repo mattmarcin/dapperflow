@@ -38,7 +38,7 @@ portable-pty = "0.9"
 alacritty_terminal = "0.26"
 fs2 = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
-toml = "0.8"
+toml = "1.1"
 
 # Internal crates.
 dflow-proto = { path = "crates/dflow-proto" }
