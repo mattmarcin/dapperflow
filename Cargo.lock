@@ -336,7 +336,7 @@ dependencies = [
  "tracing",
  "ulid",
  "win32job",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -395,7 +395,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ulid",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
