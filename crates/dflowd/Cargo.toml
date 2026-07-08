@@ -36,7 +36,7 @@ fs2.workspace = true
 # HMAC-SHA1 for short-lived signed artifact URLs (`security.md` / Artifact sandbox). The
 # same `sha1 0.10` already resolved for dflow-core, so this adds no new registry fetch;
 # HMAC is a ~20-line construction over it, keeping the dependency surface minimal.
-sha1 = "0.10"
+sha1 = "0.11"
 # ASCII/Unicode QR rendering for `dflowd --pair`, so the runbook has a usable pairing
 # path tonight (`security.md` / QR pairing). Pure Rust, no C deps; default features off
 # drops the heavy image/svg renderers - only the console string renderer is used.
