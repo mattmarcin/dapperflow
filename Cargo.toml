@@ -31,7 +31,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
-ulid = "1"
+ulid = "2"
 base64 = "0.22"
 rand = "0.9"
 portable-pty = "0.9"
