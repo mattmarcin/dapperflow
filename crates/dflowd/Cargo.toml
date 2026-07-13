@@ -43,7 +43,7 @@ sha1 = "0.10"
 qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 futures-util.workspace = true
 dflow-proto = { workspace = true }
 serde_json.workspace = true
