@@ -16,4 +16,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Blocking WebSocket client: the CLI is one request/response per invocation, so a
 # synchronous client is simpler and lighter than pulling in an async runtime.
-tungstenite = "0.29"
+tungstenite = "0.30"
