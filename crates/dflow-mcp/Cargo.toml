@@ -29,7 +29,7 @@ tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 # Blocking WebSocket client, same choice as dflow-cli: one request/response per
 # daemon call keeps the transport simple; tool calls wrap it in spawn_blocking.
-tungstenite = "0.29"
+tungstenite = "0.30"
 # The official Rust MCP SDK (modelcontextprotocol/rust-sdk). Verified current and
 # maintained at implementation time (2.1.0, updated 2026-07-02); the older
 # community `mcp-sdk`/`mcp_rust_sdk` crates are unmaintained.
