@@ -47,7 +47,7 @@ jobs:
       # this pipeline was verified green against. Bump deliberately, alongside a
       # crates-lane pass that clears any new findings. See docs/spec/cicd.md.
       - name: Install Rust (1.91 + rustfmt)
-        uses: dtolnay/rust-toolchain@1.91
+        uses: dtolnay/rust-toolchain@1.100
         with:
           components: rustfmt
       - name: cargo fmt --check
@@ -67,7 +67,7 @@ jobs:
       # (e.g. 1.96 added clippy::unnecessary_sort_by, which fires on
       # crates/dflowd/src/api.rs). Pinning keeps the gate deterministic and green.
       - name: Install Rust (1.91 + clippy)
-        uses: dtolnay/rust-toolchain@1.91
+        uses: dtolnay/rust-toolchain@1.100
         with:
           components: clippy
       - name: Cache cargo build
@@ -147,7 +147,7 @@ jobs:
           # is pinned here. Lockfiles are v9.0 (pnpm 10 compatible).
           version: 10
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 22
       # setup-node@v6 only auto-caches npm, so cache the pnpm store by hand.
@@ -208,7 +208,7 @@ jobs:
         with:
           version: 10
       - name: Install Node
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 22
 
